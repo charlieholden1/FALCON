@@ -17,6 +17,7 @@ import numpy as np
 from ultralytics import YOLO
 
 from occlusion import OcclusionState
+from radar import CameraProjection, MockRadar
 from tracking import TrackingManager
 
 # ── Configuration ───────────────────────────────────────────────────
@@ -103,6 +104,10 @@ def main():
         recovery_duration=90,
     )
 
+    # ── Mock Radar & Camera Projection ──────────────────────────────
+    mock_radar = MockRadar()
+    cam_proj   = CameraProjection()
+
     # ── Open webcam ─────────────────────────────────────────────────
     print("[FALCON] Initialising webcam …")
     cap = cv2.VideoCapture(WEBCAM_INDEX)
@@ -111,6 +116,8 @@ def main():
         return
 
     print("[FALCON] Vision system active. Press 'q' to quit.")
+
+    cv2.namedWindow("F.A.L.C.O.N. Vision", cv2.WINDOW_NORMAL)
 
     fps_timer = time.time()
     fps_value = 0.0
@@ -202,6 +209,36 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 2, cv2.LINE_AA)
             cv2.putText(vis, occ_label, (x1, y1 - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour, 1, cv2.LINE_AA)
+
+            # ── Radar crosshair for heavily occluded / lost ──────
+            if t.occlusion_state in (
+                OcclusionState.HEAVILY_OCCLUDED,
+                OcclusionState.LOST,
+            ):
+                pt3d = mock_radar.get_target_3d()
+                u, v = cam_proj.project_3d_to_2d(pt3d)
+                h_frame, w_frame = vis.shape[:2]
+                if 0 <= u < w_frame and 0 <= v < h_frame:
+                    radar_colour = (255, 0, 255)  # magenta
+                    cross_size = 20
+                    # Crosshair lines
+                    cv2.line(vis, (u - cross_size, v), (u + cross_size, v),
+                             radar_colour, 2, cv2.LINE_AA)
+                    cv2.line(vis, (u, v - cross_size), (u, v + cross_size),
+                             radar_colour, 2, cv2.LINE_AA)
+                    # Outer circle
+                    cv2.circle(vis, (u, v), cross_size, radar_colour, 2, cv2.LINE_AA)
+                    # Radar-target bounding box (80×160 px placeholder)
+                    rw, rh = 40, 80
+                    cv2.rectangle(vis, (u - rw, v - rh), (u + rw, v + rh),
+                                  radar_colour, 2)
+                    # Label
+                    cv2.putText(
+                        vis, f"RADAR TARGET #{t.track_id}",
+                        (u - rw, v - rh - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        radar_colour, 2, cv2.LINE_AA,
+                    )
 
             if t.occlusion_state in (
                 OcclusionState.PARTIALLY_OCCLUDED,
