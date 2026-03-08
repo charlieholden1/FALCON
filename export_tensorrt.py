@@ -13,5 +13,6 @@ from ultralytics import YOLO
 model = YOLO('yolo26n-pose.pt')
 
 # Export the model to TensorRT format
-# simplify=False is critical on Jetson to avoid installing onnxsim (which requires building cmake)
-model.export(format='engine', device='0', half=True, simplify=False)
+# workspace=2 (2GB) is safer for Jetson Nano/Orin Nano shared memory than default 4GB
+# simplify=False to skip onnxsim
+model.export(format='engine', device='0', half=True, simplify=False, workspace=2)
