@@ -246,7 +246,11 @@ class VisionPipeline:
                 print(f"[FALCON] Loading YOLO model on {device.upper()}...")
 
                 self.model = YOLO(cfg["path"])
-                self.model.to(device)
+
+                # Only move PyTorch models to device; TensorRT engines are device-bound by export
+                if not cfg["path"].endswith(".engine"):
+                    self.model.to(device)
+                
                 self.mp_pose = None
                 return ""
             except Exception as exc:
