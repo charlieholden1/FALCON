@@ -417,15 +417,28 @@ class VisionPipeline:
         det_keypoints = None
 
         if result.boxes is not None and len(result.boxes) > 0:
-            xyxy = result.boxes.xyxy.cpu().numpy()
-            confs = result.boxes.conf.cpu().numpy()
-            mask = confs >= CONFIDENCE_THRESHOLD
-            det_boxes = xyxy[mask]
-            det_confs = confs[mask]
+            # OPTIMIZATION: Process filtering on GPU to reduce transfer volume
+            boxes = result.boxes
+            # boxes.conf and boxes.xyxy keep data on device (cuda:0)
+            
+            # Create a boolean mask on GPU
+            mask = boxes.conf >= CONFIDENCE_THRESHOLD
+            
+            # Apply mask on GPU tensors (much faster!)
+            filtered_boxes = boxes.xyxy[mask]
+            filtered_confs = boxes.conf[mask]
 
-            if result.keypoints is not None and len(result.keypoints) > 0:
-                kp_data = result.keypoints.data.cpu().numpy()
-                det_keypoints = kp_data[mask]
+            # Only transfer the filtered results to CPU
+            if len(filtered_boxes) > 0:
+                det_boxes = filtered_boxes.cpu().numpy()
+                det_confs = filtered_confs.cpu().numpy()
+
+                if result.keypoints is not None:
+                    # Filter keypoints on GPU too
+                    kp_data = result.keypoints.data
+                    if len(kp_data) > 0:
+                        filtered_kps = kp_data[mask]
+                        det_keypoints = filtered_kps.cpu().numpy()
 
         return det_boxes, det_confs, det_keypoints
 
@@ -807,20 +820,24 @@ class FalconGUI:
         frame = self.pipeline.get_frame()
         if frame is not None:
             # Convert BGR → RGB → PIL → PhotoImage
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(rgb)
-
-            # Scale to fit the label while keeping aspect ratio
+            # Resize *before* heavier conversions (OpenCV resize is faster than PIL resize)
             lw = self.video_label.winfo_width()
             lh = self.video_label.winfo_height()
-            if lw > 1 and lh > 1:
-                img_w, img_h = pil_img.size
-                scale = min(lw / img_w, lh / img_h)
-                new_w = max(int(img_w * scale), 1)
-                new_h = max(int(img_h * scale), 1)
-                pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
 
-            self._photo = ImageTk.PhotoImage(pil_img)
+            if lw > 1 and lh > 1:
+                h, w = frame.shape[:2]  # frame is numpy array
+                scale = min(lw / w, lh / h)
+                new_w = max(int(w * scale), 1)
+                new_h = max(int(h * scale), 1)
+                
+                # Use INTER_LINEAR or NEAREST for speed (LANCZOS/CUBIC is too slow)
+                if new_w != w or new_h != h:
+                    frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb)
+            
+            self._photo = ImageTk.PhotoImage(image=pil_img)
             self.video_label.configure(image=self._photo, text="")
 
             # Update FPS readout
