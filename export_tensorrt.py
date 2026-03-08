@@ -4,4 +4,5 @@ from ultralytics import YOLO
 model = YOLO('yolo26n-pose.pt')
 
 # Export the model to TensorRT format
-model.export(format='engine', device='0', half=True)  # half=True for FP16 optimization
+# simplify=False is critical on Jetson to avoid installing onnxsim (which requires building cmake)
+model.export(format='engine', device='0', half=True, simplify=False)
