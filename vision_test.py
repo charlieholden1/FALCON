@@ -94,7 +94,11 @@ def _draw_trail(
 def main():
     # ── Load model ──────────────────────────────────────────────────
     print("[FALCON] Loading YOLO26n-Pose model …")
+    import torch
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"[FALCON] Using device: {device.upper()}")
     model = YOLO(MODEL_PATH)
+    model.to(device)
 
     # ── Tracking & occlusion subsystems ─────────────────────────────
     tracker = TrackingManager(

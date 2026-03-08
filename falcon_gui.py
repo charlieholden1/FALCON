@@ -234,8 +234,14 @@ class VisionPipeline:
 
         if self.backend == "yolo":
             try:
+                import torch
                 from ultralytics import YOLO
+
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                print(f"[FALCON] Loading YOLO model on {device.upper()}...")
+
                 self.model = YOLO(cfg["path"])
+                self.model.to(device)
                 self.mp_pose = None
                 return ""
             except Exception as exc:
@@ -250,6 +256,17 @@ class VisionPipeline:
                     PoseLandmarkerOptions,
                     RunningMode,
                 )
+
+                # Check for GPU delegate availability (MediaPipe uses GPU delegate, not CUDA directly)
+                # Note: On Linux/Jetson, MediaPipe Python GPU support can be tricky.
+                delegate = BaseOptions.Delegate.CPU
+                try:
+                    # Attempt to use GPU delegate if available
+                    delegate = BaseOptions.Delegate.GPU
+                except AttributeError:
+                    pass
+
+                print(f"[FALCON] Loading MediaPipe model with delegate: {delegate}...")
 
                 import os
                 model_path = os.path.join(
@@ -267,7 +284,7 @@ class VisionPipeline:
                     )
 
                 options = PoseLandmarkerOptions(
-                    base_options=BaseOptions(model_asset_path=model_path),
+                    base_options=BaseOptions(model_asset_path=model_path, delegate=delegate),
                     running_mode=RunningMode.IMAGE,
                     num_poses=1,
                     min_pose_detection_confidence=0.5,
