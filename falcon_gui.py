@@ -37,6 +37,11 @@ MODEL_OPTIONS = {
         "path": "yolo26n-pose.pt",
         "description": "High speed, multi-person support",
     },
+    "YOLO26 Nano (TensorRT)": {
+        "backend": "yolo",
+        "path": "yolo26n-pose.engine",
+        "description": "Optimized for Jetson (Requires export)",
+    },
     "YOLO26 Large": {
         "backend": "yolo",
         "path": "yolo26l-pose.pt",
