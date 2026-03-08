@@ -1,3 +1,12 @@
+import os
+import ctypes
+
+# Force load libgomp before anything else to fix "cannot allocate memory in static TLS block"
+try:
+    ctypes.CDLL('/usr/lib/aarch64-linux-gnu/libgomp.so.1', mode=ctypes.RTLD_GLOBAL)
+except OSError:
+    print("Warning: Could not preload libgomp.so.1 - you might see TLS errors.")
+
 from ultralytics import YOLO
 
 # Load the YOLO model
