@@ -13,6 +13,6 @@ from ultralytics import YOLO
 model = YOLO('yolo26n-pose.pt')
 
 # Export the model to TensorRT format
-# workspace=1 (1GB) extremely conservative for 8GB Jetson due to OS + PyTorch overhead
+# workspace=0.5 (512MB) extremely limited for crowded environment
 # simplify=False to skip onnxsim
-model.export(format='engine', device='0', half=True, simplify=False, workspace=1)
+model.export(format='engine', device='0', half=True, simplify=False, workspace=0.5)
