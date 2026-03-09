@@ -162,9 +162,9 @@ class DualStreamCamera:
     # ── RealSense initialisation ────────────────────────────────────
 
     # RealSense stream resolution defaults
-    _RS_COLOR_W: int = 1280
-    _RS_COLOR_H: int = 720
-    _RS_DEPTH_W: int = 848
+    _RS_COLOR_W: int = 640
+    _RS_COLOR_H: int = 480
+    _RS_DEPTH_W: int = 640
     _RS_DEPTH_H: int = 480
 
     def _init_realsense(

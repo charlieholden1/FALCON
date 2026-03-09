@@ -36,22 +36,8 @@ def _draw_dashed_rect(
     thickness: int = 2,
     dash_len: int = 10,
 ) -> None:
-    """Draw a dashed rectangle on *img* (OpenCV has no native dashed rect)."""
-    x1, y1 = pt1
-    x2, y2 = pt2
-    edges = [
-        ((x1, y1), (x2, y1)),
-        ((x2, y1), (x2, y2)),
-        ((x2, y2), (x1, y2)),
-        ((x1, y2), (x1, y1)),
-    ]
-    for (sx, sy), (ex, ey) in edges:
-        dist = int(np.hypot(ex - sx, ey - sy))
-        pts_x = np.linspace(sx, ex, max(dist // dash_len, 2)).astype(int)
-        pts_y = np.linspace(sy, ey, max(dist // dash_len, 2)).astype(int)
-        for i in range(0, len(pts_x) - 1, 2):
-            cv2.line(img, (pts_x[i], pts_y[i]),
-                     (pts_x[i + 1], pts_y[i + 1]), colour, thickness)
+    """Draw a solid rectangle (replaces per-edge dash loops)."""
+    cv2.rectangle(img, pt1, pt2, colour, thickness, cv2.LINE_AA)
 
 
 def _draw_uncertainty_ellipse(
@@ -76,15 +62,12 @@ def _draw_trail(
     pts = history[-max_len:]
     if len(pts) < 2:
         return
-    for i in range(1, len(pts)):
-        cx1 = int((pts[i - 1][0] + pts[i - 1][2]) / 2)
-        cy1 = int((pts[i - 1][1] + pts[i - 1][3]) / 2)
-        cx2 = int((pts[i][0] + pts[i][2]) / 2)
-        cy2 = int((pts[i][1] + pts[i][3]) / 2)
-        # Fade older segments
-        alpha = (i / len(pts))
-        fade = tuple(int(c * alpha) for c in colour)
-        cv2.line(img, (cx1, cy1), (cx2, cy2), fade, 2, cv2.LINE_AA)
+    centers = np.array(
+        [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in pts],
+        dtype=np.int32,
+    )
+    cv2.polylines(img, [centers], isClosed=False, color=colour,
+                  thickness=2, lineType=cv2.LINE_AA)
 
 
 # ── Main loop ───────────────────────────────────────────────────────

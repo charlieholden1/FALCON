@@ -46,21 +46,8 @@ def iou(boxA: np.ndarray, boxB: np.ndarray) -> float:
 
 
 def _compute_histogram(frame: np.ndarray, bbox: np.ndarray) -> Optional[np.ndarray]:
-    """Extract a normalised HSV colour histogram from *bbox* region of *frame*."""
-    h_frame, w_frame = frame.shape[:2]
-    x1 = max(0, int(bbox[0]))
-    y1 = max(0, int(bbox[1]))
-    x2 = min(w_frame, int(bbox[2]))
-    y2 = min(h_frame, int(bbox[3]))
-    if x2 - x1 < 4 or y2 - y1 < 4:
-        return None
-    roi = frame[y1:y2, x1:x2]
-    roi = cv2.resize(roi, (64, 64), interpolation=cv2.INTER_LINEAR)
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1], None, [32, 32],
-                        [0, 180, 0, 256])
-    cv2.normalize(hist, hist)
-    return hist
+    """Histogram computation disabled for Jetson CPU performance."""
+    return None
 
 
 def _compare_histograms(
@@ -199,8 +186,8 @@ class TrackingManager:
         max_frames_lost: int = 20,
         prediction_decay: float = 0.90,
         recovery_duration: int = 20,
-        iou_weight: float = 0.5,
-        hist_weight: float = 0.5,
+        iou_weight: float = 1.0,
+        hist_weight: float = 0.0,
     ):
         self.iou_threshold = iou_threshold
         self.max_frames_lost = max_frames_lost
