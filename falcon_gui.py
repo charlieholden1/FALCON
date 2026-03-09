@@ -498,7 +498,7 @@ class VisionPipeline:
         return np.empty((0, 4)), np.empty(0), None
 
     def _detect_yolo(self, frame):
-        results = self.model(frame, verbose=False, half=self._yolo_half, imgsz=320)
+        results = self.model(frame, verbose=False, half=self._yolo_half)
         result = results[0]
 
         det_boxes = np.empty((0, 4))
