@@ -117,6 +117,8 @@ class OcclusionAnalyzer:
         bbox: Optional[np.ndarray],
         detection_confidence: float,
         frames_since_detection: int = 0,
+        current_depth: Optional[float] = None,
+        predicted_depth: Optional[float] = None,
     ) -> OcclusionState:
         """
         Classify occlusion level for one person.
@@ -133,6 +135,12 @@ class OcclusionAnalyzer:
         frames_since_detection : int
             How many frames since this person was last *detected* (0 = detected
             this frame).
+        current_depth : float | None
+            Live depth reading (metres) at the track's predicted bbox
+            centre, or ``None`` when depth is unavailable.
+        predicted_depth : float | None
+            The person's last known depth (metres) from their most
+            recent successful detection, or ``None``.
 
         Returns
         -------
@@ -142,8 +150,10 @@ class OcclusionAnalyzer:
         if frames_since_detection >= self.lost_frame_limit:
             return OcclusionState.LOST
 
-        # If no detection this frame, rely on frame gap
+        # If no detection this frame, check depth-based occlusion
         if frames_since_detection > 0:
+            if self._is_depth_occluded(current_depth, predicted_depth):
+                return OcclusionState.HEAVILY_OCCLUDED
             # Still within tracking window → HEAVILY_OCCLUDED
             return OcclusionState.HEAVILY_OCCLUDED
 
@@ -157,6 +167,34 @@ class OcclusionAnalyzer:
             return OcclusionState.PARTIALLY_OCCLUDED
 
         return OcclusionState.HEAVILY_OCCLUDED
+
+    # ── depth-based occlusion check ──────────────────────────────────
+
+    @staticmethod
+    def _is_depth_occluded(
+        current_depth: Optional[float],
+        predicted_depth: Optional[float],
+        margin: float = 0.30,
+    ) -> bool:
+        """Return True when depth evidence proves a physical occlusion.
+
+        If the depth sensor reads an object at the person's predicted
+        location that is *closer* to the camera than the person's last
+        known depth (by at least *margin* metres), we conclude that
+        something is physically blocking the person.
+
+        Parameters
+        ----------
+        current_depth : float | None
+            Live depth reading at the predicted bbox centre (metres).
+        predicted_depth : float | None
+            Person's last known depth from their most recent detection.
+        margin : float
+            Minimum depth difference (metres) to count as occluded.
+        """
+        if current_depth is None or predicted_depth is None:
+            return False
+        return current_depth < predicted_depth - margin
 
     def region_visibility(
         self, keypoints: Optional[np.ndarray]

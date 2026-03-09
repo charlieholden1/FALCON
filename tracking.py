@@ -320,11 +320,16 @@ class TrackingManager:
 
         # 6. Classify occlusion for every track + recovery bookkeeping
         for track in self.tracks:
+            # Query live depth at the track's current (possibly predicted) bbox
+            current_depth = self._query_depth(depth_frame, track.bbox)
+
             raw_state = self.occlusion_analyzer.analyze(
                 keypoints=track.keypoints if not track.is_predicted else None,
                 bbox=track.bbox,
                 detection_confidence=track.detection_conf,
                 frames_since_detection=track.frames_since_detection,
+                current_depth=current_depth,
+                predicted_depth=track.z_depth_meters,
             )
 
             if raw_state in (
@@ -415,18 +420,37 @@ class TrackingManager:
         depth_frame: Optional[np.ndarray],
         bbox: np.ndarray,
     ) -> Optional[float]:
-        """Return depth in metres at the centre of *bbox*, or None."""
+        """Return median depth in metres from a central ROI of *bbox*.
+
+        Samples a 10 %× 10 % patch around the bbox centre and takes the
+        median of all non-zero pixels, making the reading robust to the
+        zero-valued holes that RealSense depth frames typically contain.
+        """
         if depth_frame is None:
             return None
-        cx = int((bbox[0] + bbox[2]) / 2)
-        cy = int((bbox[1] + bbox[3]) / 2)
-        h, w = depth_frame.shape[:2]
-        cx = max(0, min(cx, w - 1))
-        cy = max(0, min(cy, h - 1))
-        raw = int(depth_frame[cy, cx])
-        if raw == 0:
+        frame_h, frame_w = depth_frame.shape[:2]
+
+        bx1, by1, bx2, by2 = bbox[:4]
+        bw = bx2 - bx1
+        bh = by2 - by1
+
+        # 10 % of bbox dimensions, at least 2 px each side
+        half_rw = max(int(bw * 0.05), 2)
+        half_rh = max(int(bh * 0.05), 2)
+
+        cx = int((bx1 + bx2) / 2)
+        cy = int((by1 + by2) / 2)
+
+        r_x1 = max(0, cx - half_rw)
+        r_y1 = max(0, cy - half_rh)
+        r_x2 = min(frame_w, cx + half_rw)
+        r_y2 = min(frame_h, cy + half_rh)
+
+        patch = depth_frame[r_y1:r_y2, r_x1:r_x2]
+        valid = patch[patch > 0]
+        if len(valid) == 0:
             return None
-        return raw / 1000.0
+        return float(np.median(valid)) / 1000.0
 
     def _update_track(
         self,

@@ -173,6 +173,19 @@ class DualStreamCamera:
         pipe.start(cfg)
         self._rs_pipeline = pipe
         self._rs_align = rs.align(rs.stream.color)
+
+        # Post-processing filters for cleaner depth maps
+        self._rs_spatial = rs.spatial_filter()
+        self._rs_spatial.set_option(rs.option.filter_magnitude, 2)
+        self._rs_spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
+        self._rs_spatial.set_option(rs.option.filter_smooth_delta, 20)
+
+        self._rs_temporal = rs.temporal_filter()
+        self._rs_temporal.set_option(rs.option.filter_smooth_alpha, 0.4)
+        self._rs_temporal.set_option(rs.option.filter_smooth_delta, 20)
+
+        self._rs_hole_fill = rs.hole_filling_filter()
+
         self._using_realsense = True
         self._opened = True
         label = f" (S/N {serial})" if serial else ""
@@ -274,6 +287,13 @@ class DualStreamCamera:
             return None, None
         if not color_frame:
             return None, None
+
+        # Apply post-processing filters to the depth frame
+        if depth_frame:
+            depth_frame = self._rs_spatial.process(depth_frame)
+            depth_frame = self._rs_temporal.process(depth_frame)
+            depth_frame = self._rs_hole_fill.process(depth_frame)
+
         color = np.asanyarray(color_frame.get_data())
         depth = np.asanyarray(depth_frame.get_data()) if depth_frame else None
         return color, depth
