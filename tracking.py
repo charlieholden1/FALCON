@@ -55,6 +55,7 @@ def _compute_histogram(frame: np.ndarray, bbox: np.ndarray) -> Optional[np.ndarr
     if x2 - x1 < 4 or y2 - y1 < 4:
         return None
     roi = frame[y1:y2, x1:x2]
+    roi = cv2.resize(roi, (64, 64), interpolation=cv2.INTER_LINEAR)
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     hist = cv2.calcHist([hsv], [0, 1], None, [32, 32],
                         [0, 180, 0, 256])

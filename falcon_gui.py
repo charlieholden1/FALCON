@@ -187,34 +187,27 @@ def _draw_skeleton(img, keypoints, colour, conf_thresh=0.4):
 
 
 def _draw_ghost_skeleton(img, keypoints, conf_thresh=0.3, dash_len=8):
-    """Draw a semi-transparent dashed skeleton for predicted (ghost) poses."""
+    """Draw a dashed skeleton for predicted (ghost) poses directly on *img*."""
     if keypoints is None:
         return
-    ghost_colour = (200, 200, 100)  # light cyan/gray in BGR
-    # Semi-transparent overlay
-    overlay = img.copy()
+    ghost_colour = (160, 160, 130)  # pale cyan/gray in BGR
     for (i, j) in SKELETON_CONNECTIONS:
         if i >= len(keypoints) or j >= len(keypoints):
             continue
         xi, yi, ci = keypoints[i]
         xj, yj, cj = keypoints[j]
         if ci > conf_thresh and cj > conf_thresh:
-            # Dashed limb
-            p1 = np.array([xi, yi])
-            p2 = np.array([xj, yj])
-            dist = int(np.linalg.norm(p2 - p1))
+            dist = int(np.hypot(xj - xi, yj - yi))
             n_pts = max(dist // dash_len, 2)
             xs = np.linspace(xi, xj, n_pts).astype(int)
             ys = np.linspace(yi, yj, n_pts).astype(int)
             for k in range(0, len(xs) - 1, 2):
-                cv2.line(overlay, (xs[k], ys[k]),
-                         (xs[k + 1], ys[k + 1]), ghost_colour, 2, cv2.LINE_AA)
-    # Ghost keypoint dots (hollow circles)
+                cv2.line(img, (xs[k], ys[k]),
+                         (xs[k + 1], ys[k + 1]), ghost_colour, 1, cv2.LINE_AA)
     for kp_idx in range(len(keypoints)):
         kx, ky, kc = keypoints[kp_idx]
         if kc > conf_thresh:
-            cv2.circle(overlay, (int(kx), int(ky)), 4, ghost_colour, 1, cv2.LINE_AA)
-    cv2.addWeighted(overlay, 0.5, img, 0.5, 0, img)
+            cv2.circle(img, (int(kx), int(ky)), 3, ghost_colour, 1, cv2.LINE_AA)
 
 
 # ── Asynchronous Webcam Capture ──────────────────────────────────────
