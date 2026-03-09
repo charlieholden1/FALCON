@@ -93,6 +93,25 @@ _MP_TO_COCO = {
 CONFIDENCE_THRESHOLD = 0.45
 TRAIL_LENGTH = 10
 
+# ── Hardware-accelerated resize helper ───────────────────────────────
+
+try:
+    _cuda_resize = cv2.cuda.resize  # type: ignore[attr-defined]
+    _HAS_CUDA_RESIZE = True
+except AttributeError:
+    _HAS_CUDA_RESIZE = False
+
+
+def _gpu_resize(frame: np.ndarray, new_w: int, new_h: int) -> np.ndarray:
+    """Resize using cv2.cuda when available, else CPU INTER_NEAREST."""
+    if _HAS_CUDA_RESIZE:
+        gpu_mat = cv2.cuda.GpuMat()
+        gpu_mat.upload(frame)
+        gpu_out = cv2.cuda.resize(gpu_mat, (new_w, new_h),
+                                  interpolation=cv2.INTER_NEAREST)
+        return gpu_out.download()
+    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
 
 # ── MediaPipe helper ────────────────────────────────────────────────
 
@@ -277,13 +296,20 @@ class VisionPipeline:
                 from ultralytics import YOLO
 
                 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                is_engine = cfg["path"].endswith(".engine")
                 print(f"[FALCON] Loading YOLO model on {device.upper()}...")
 
-                self.model = YOLO(cfg["path"])
+                self.model = YOLO(cfg["path"], task="pose")
 
-                # Only move PyTorch models to device; TensorRT engines are device-bound by export
-                if not cfg["path"].endswith(".engine"):
+                if is_engine:
+                    # TensorRT engine – run FP16 inference; device is baked in
+                    self._yolo_half = True
+                elif device == "cuda":
                     self.model.to(device)
+                    # Use FP16 on CUDA-capable GPUs (large speedup on Jetson)
+                    self._yolo_half = True
+                else:
+                    self._yolo_half = False
                 
                 self.mp_pose = None
                 return ""
@@ -490,7 +516,7 @@ class VisionPipeline:
         return np.empty((0, 4)), np.empty(0), None
 
     def _detect_yolo(self, frame):
-        results = self.model(frame, verbose=False)
+        results = self.model(frame, verbose=False, half=self._yolo_half)
         result = results[0]
 
         det_boxes = np.empty((0, 4))
@@ -498,28 +524,24 @@ class VisionPipeline:
         det_keypoints = None
 
         if result.boxes is not None and len(result.boxes) > 0:
-            # OPTIMIZATION: Process filtering on GPU to reduce transfer volume
             boxes = result.boxes
-            # boxes.conf and boxes.xyxy keep data on device (cuda:0)
-            
-            # Create a boolean mask on GPU
+
+            # Filter on-device – single boolean mask, no intermediate copies
             mask = boxes.conf >= CONFIDENCE_THRESHOLD
-            
-            # Apply mask on GPU tensors (much faster!)
+
             filtered_boxes = boxes.xyxy[mask]
-            filtered_confs = boxes.conf[mask]
+            if len(filtered_boxes) == 0:
+                return det_boxes, det_confs, det_keypoints
 
-            # Only transfer the filtered results to CPU
-            if len(filtered_boxes) > 0:
-                det_boxes = filtered_boxes.cpu().numpy()
-                det_confs = filtered_confs.cpu().numpy()
+            # Transfer only filtered, contiguous float32 tensors to CPU
+            det_boxes = filtered_boxes.float().contiguous().cpu().numpy()
+            det_confs = boxes.conf[mask].float().contiguous().cpu().numpy()
 
-                if result.keypoints is not None:
-                    # Filter keypoints on GPU too
-                    kp_data = result.keypoints.data
-                    if len(kp_data) > 0:
-                        filtered_kps = kp_data[mask]
-                        det_keypoints = filtered_kps.cpu().numpy()
+            if result.keypoints is not None and len(result.keypoints.data) > 0:
+                det_keypoints = (
+                    result.keypoints.data[mask]
+                    .float().contiguous().cpu().numpy()
+                )
 
         return det_boxes, det_confs, det_keypoints
 
@@ -880,9 +902,8 @@ class FalconGUI:
                 new_w = max(int(w * scale), 1)
                 new_h = max(int(h * scale), 1)
                 
-                # Use INTER_LINEAR or NEAREST for speed (LANCZOS/CUBIC is too slow)
                 if new_w != w or new_h != h:
-                    frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                    frame = _gpu_resize(frame, new_w, new_h)
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(rgb)
@@ -910,3 +931,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
