@@ -359,13 +359,25 @@ class VisionPipeline:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             self.cap.set(cv2.CAP_PROP_FPS, 30)
+
+            # ATTEMPT TO FIX LOW LIGHT FPS DROP (Auto-Exposure)
+            # 0.25 means "Manual" in V4L2 (0.75 is Auto)
+            # 1 means "Manual" in some backends (3 is Auto)
+            try:
+                # Try standard V4L2 Manual mode
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                # Set exposure time (lower = darker but faster FPS)
+                # Value depends on camera, try a few common ranges
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, 0.01) 
+            except:
+                pass
             
             # Logging actual obtained settings
             actual_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
             actual_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
             actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
             mode = self.cap.get(cv2.CAP_PROP_FOURCC)
-            print(f"[FALCON] Camera {index} active: {actual_w}x{actual_h} @ {actual_fps}FPS (FourCC: {mode})")
+            print(f"[FALCON] Camera {index} active: {actual_w}x{actual_h} @ {actual_fps}FPS")
             
         return self.cap.isOpened()
 
@@ -421,9 +433,7 @@ class VisionPipeline:
                 time.sleep(0.01)
                 continue
 
-            t0 = time.time()
             ret, frame = self.cap.read()
-            t1 = time.time()
             if not ret:
                 time.sleep(0.01)
                 continue
@@ -431,29 +441,14 @@ class VisionPipeline:
             h_frame, w_frame = frame.shape[:2]
 
             # ── detection ────────────────────────────────────────────
-            t2 = time.time()
             det_boxes, det_confs, det_keypoints = self._detect(frame, w_frame, h_frame)
-            t3 = time.time()
 
             # ── tracking ─────────────────────────────────────────────
             tracks = self.tracker.update(det_boxes, det_keypoints, det_confs)
-            t4 = time.time()
 
             # ── annotate ─────────────────────────────────────────────
             vis = frame.copy()
             self._annotate(vis, tracks)
-            t5 = time.time()
-            
-            # Debug Timing (Remove later)
-            read_ms = (t1 - t0) * 1000
-            detect_ms = (t3 - t2) * 1000
-            track_ms = (t4 - t3) * 1000
-            anno_ms = (t5 - t4) * 1000
-            total_ms = (t5 - t0) * 1000
-            
-            # Print only occasionally to avoid console spam slowing it down more
-            if self._frame_count % 30 == 0:
-                 print(f"[Profile] Read: {read_ms:.1f}ms | Detect: {detect_ms:.1f}ms | Track: {track_ms:.1f}ms | Anno: {anno_ms:.1f}ms | Total: {total_ms:.1f}ms")
 
             # ── FPS ──────────────────────────────────────────────────
             self._frame_count += 1
