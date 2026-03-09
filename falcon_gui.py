@@ -368,13 +368,13 @@ class VisionPipeline:
                 self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) 
                 
                 # Set manual exposure value (100-200 is typical for 30fps indoor)
-                # Increasing to 450 to brighten image while trying to hold 30fps.
-                # If FPS drops to 15, we hit the limit of 33ms shutter speed.
-                self.cap.set(cv2.CAP_PROP_EXPOSURE, 450)
+                # 450 dropped FPS to 22. Dialing back to safe 30fps range.
+                # Try 150-300 range.
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, 320)
                 
-                # Also bump the Gain (digital amplification)
-                # This helps brightness without slowing down the frame rate
-                self.cap.set(cv2.CAP_PROP_GAIN, 128)
+                # Boost Gain heavily to compensate for lower exposure time
+                # Max gain is usually around 255. Bumping up from 128 -> 200.
+                self.cap.set(cv2.CAP_PROP_GAIN, 200)
             except:
                 pass
             
