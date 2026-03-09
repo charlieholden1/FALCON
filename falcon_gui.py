@@ -368,10 +368,13 @@ class VisionPipeline:
                 self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) 
                 
                 # Set manual exposure value (100-200 is typical for 30fps indoor)
-                # If image is too dark, INCREASE this value (e.g. 200, 250, 300)
-                # If you go too high, FPS will drop back to 15.
-                # Try 250 as a balance.
-                self.cap.set(cv2.CAP_PROP_EXPOSURE, 250)
+                # Increasing to 450 to brighten image while trying to hold 30fps.
+                # If FPS drops to 15, we hit the limit of 33ms shutter speed.
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, 450)
+                
+                # Also bump the Gain (digital amplification)
+                # This helps brightness without slowing down the frame rate
+                self.cap.set(cv2.CAP_PROP_GAIN, 128)
             except:
                 pass
             
