@@ -360,14 +360,18 @@ class VisionPipeline:
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             self.cap.set(cv2.CAP_PROP_FPS, 30)
 
-            # ATTEMPT TO FIX LOW LIGHT FPS DROP (Auto-Exposure)
-            # 0.25 means "Manual" in V4L2 (0.75 is Auto)
-            # 1 means "Manual" in some backends (3 is Auto)
+            # Logitech C270 specifc settings for 30FPS
+            # 1 = Manual Exposure, 3 = Auto Exposure (V4L2 standard)
+            # 0.25 is sometimes used in older bindings, but 1 is usually safer.
             try:
-                # Try standard V4L2 Manual mode
-                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-                # Set exposure time (lower = darker but faster FPS)
-                # Value depends on camera, try a few common ranges
+                # Disable auto exposure
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) 
+                # Set manual exposure value (100-200 is typical for 30fps indoor)
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, 150)
+            except:
+                pass
+            
+            # Logging actual obtained settings
                 self.cap.set(cv2.CAP_PROP_EXPOSURE, 0.01) 
             except:
                 pass
