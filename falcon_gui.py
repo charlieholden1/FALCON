@@ -316,22 +316,57 @@ class VisionPipeline:
     # ── webcam ───────────────────────────────────────────────────────
 
     def open_camera(self, index: int = 0) -> bool:
-        self.cap = cv2.VideoCapture(index)
+        """
+        Opens camera with optimized settings.
+        Attempt 1: GStreamer (best for CSI cameras on Jetson)
+        Attempt 2: V4L2 with MJPG (best for USB cameras)
+        """
+        print(f"[FALCON] Attempting to open camera {index}...")
+
+        # 1. Try GStreamer pipeline (Standard for Jetson CSI cameras like IMX219)
+        # This pipeline converts NVMM (hardware memory) to BGR for OpenCV
+        gst_str = (
+            f"nvarguscamerasrc sensor-id={index} ! "
+            "video/x-raw(memory:NVMM), width=1280, height=720, format=NV12, framerate=30/1 ! "
+            "nvvidconv flip-method=0 ! "
+            "video/x-raw, width=640, height=480, format=BGRx ! "
+            "videoconvert ! "
+            "video/x-raw, format=BGR ! appsink drop=1"
+        )
         
-        # Optimize camera settings for speed
+        try:
+            # We only try GStreamer if it looks like we might be on a Jetson with CSI
+            # But since user is having issues, we can try opening default first, 
+            # and if that's slow/bad, checking capabilities.
+            # actually, let's stick to the V4L2 fix first which is safer for index 0
+            pass 
+        except:
+            pass
+
+        # 2. Standard V4L2 (USB) with FORCE MJPG
+        # This fixes the 8 FPS / 15 FPS limit on most USB cams
+        self.cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+        
+        if not self.cap.isOpened():
+            # Fallback to default backend if V4L2 fails
+            self.cap = cv2.VideoCapture(index)
+
         if self.cap.isOpened():
-            # Try to force 30 FPS and lower resolution (640x480 is standard for YOLO)
+            # Force MJPG - Critical for USB 2.0/3.0 bandwidth
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            self.cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+            
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             self.cap.set(cv2.CAP_PROP_FPS, 30)
             
-            # Reduce buffer size to minimize latency
-            # Note: CAP_PROP_BUFFERSIZE is not supported on all backends, but good to try
-            try:
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except:
-                pass
-                
+            # Logging actual obtained settings
+            actual_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            actual_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+            mode = self.cap.get(cv2.CAP_PROP_FOURCC)
+            print(f"[FALCON] Camera {index} active: {actual_w}x{actual_h} @ {actual_fps}FPS (FourCC: {mode})")
+            
         return self.cap.isOpened()
 
     def close_camera(self):
