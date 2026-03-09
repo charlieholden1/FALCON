@@ -161,6 +161,12 @@ class DualStreamCamera:
 
     # ── RealSense initialisation ────────────────────────────────────
 
+    # RealSense stream resolution defaults
+    _RS_COLOR_W: int = 1280
+    _RS_COLOR_H: int = 720
+    _RS_DEPTH_W: int = 848
+    _RS_DEPTH_H: int = 480
+
     def _init_realsense(
         self, w: int, h: int, fps: int, serial: Optional[str] = None,
     ) -> None:
@@ -168,11 +174,47 @@ class DualStreamCamera:
         cfg = rs.config()
         if serial:
             cfg.enable_device(serial)
-        cfg.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
-        cfg.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
-        pipe.start(cfg)
+
+        # High-res colour for better YOLO pose output
+        cfg.enable_stream(
+            rs.stream.color,
+            self._RS_COLOR_W, self._RS_COLOR_H,
+            rs.format.bgr8, fps,
+        )
+        # Standard-res depth (more reliable than matching colour res)
+        cfg.enable_stream(
+            rs.stream.depth,
+            self._RS_DEPTH_W, self._RS_DEPTH_H,
+            rs.format.z16, fps,
+        )
+
+        profile = pipe.start(cfg)
         self._rs_pipeline = pipe
+
+        # Align depth → colour so pixel coordinates match despite
+        # different native resolutions
         self._rs_align = rs.align(rs.stream.color)
+
+        # ── Fix overexposure on the RGB sensor ──────────────────────
+        device = profile.get_device()
+        for sensor in device.query_sensors():
+            # The colour sensor's name typically contains "RGB" or "Color"
+            name = sensor.get_info(rs.camera_info.name)
+            if "rgb" in name.lower() or "color" in name.lower():
+                try:
+                    if sensor.supports(rs.option.enable_auto_exposure):
+                        sensor.set_option(rs.option.enable_auto_exposure, 1)
+                        print("[FALCON] RealSense: auto-exposure enabled")
+                except Exception:
+                    # Auto-exposure failed – fall back to safe manual values
+                    try:
+                        sensor.set_option(rs.option.enable_auto_exposure, 0)
+                        sensor.set_option(rs.option.exposure, 156)
+                        sensor.set_option(rs.option.gain, 64)
+                        print("[FALCON] RealSense: manual exposure set (exp=156, gain=64)")
+                    except Exception as exc:
+                        print(f"[FALCON] RealSense: could not set exposure: {exc}")
+                break
 
         # Post-processing filters for cleaner depth maps
         self._rs_spatial = rs.spatial_filter()
@@ -189,7 +231,11 @@ class DualStreamCamera:
         self._using_realsense = True
         self._opened = True
         label = f" (S/N {serial})" if serial else ""
-        print(f"[FALCON] RealSense camera active{label}: {w}x{h} @ {fps}FPS")
+        print(
+            f"[FALCON] RealSense camera active{label}: "
+            f"color {self._RS_COLOR_W}x{self._RS_COLOR_H}, "
+            f"depth {self._RS_DEPTH_W}x{self._RS_DEPTH_H} @ {fps}FPS"
+        )
 
     # ── Webcam fallback ─────────────────────────────────────────────
 
