@@ -66,19 +66,23 @@ def get_depth_meters(
 
 class DualStreamCamera:
     """
-    Unified camera that tries Intel RealSense (colour + aligned depth)
-    first and falls back to a threaded USB webcam capture.
+    Unified camera that opens either an Intel RealSense depth camera or
+    a standard USB webcam, depending on the *use_realsense* flag.
 
     Parameters
     ----------
     webcam_index : int
-        OpenCV camera index used when RealSense is unavailable.
+        OpenCV camera index (only used when *use_realsense* is False).
     width, height : int
         Requested stream resolution.
     fps : int
         Requested frame rate.
     q_size : int
-        Queue depth for the webcam fallback reader thread.
+        Queue depth for the webcam reader thread.
+    use_realsense : bool
+        If True, open an Intel RealSense device instead of a webcam.
+    realsense_serial : str | None
+        Optional serial number to target a specific RealSense device.
     """
 
     def __init__(
@@ -88,6 +92,8 @@ class DualStreamCamera:
         height: int = 480,
         fps: int = 30,
         q_size: int = 2,
+        use_realsense: bool = False,
+        realsense_serial: Optional[str] = None,
     ):
         self._rs_pipeline = None
         self._rs_align = None
@@ -101,22 +107,67 @@ class DualStreamCamera:
         self._q_size = q_size
         self._opened = False
 
-        # Try RealSense first
-        if _HAS_REALSENSE:
+        if use_realsense and _HAS_REALSENSE:
             try:
-                self._init_realsense(width, height, fps)
+                self._init_realsense(width, height, fps, realsense_serial)
                 return
             except Exception as exc:
-                print(f"[FALCON] RealSense not available: {exc}")
+                print(f"[FALCON] RealSense failed to start: {exc}")
 
-        # Fall back to webcam
+        # Webcam path (either by choice or RealSense fallback)
         self._init_webcam(webcam_index, width, height, fps)
+
+    # ── device discovery ────────────────────────────────────────────
+
+    @staticmethod
+    def discover_cameras() -> list:
+        """
+        Return a list of available camera descriptors.
+
+        Each entry is a dict with keys:
+            label  : str  – human-readable name for the GUI
+            type   : str  – ``'realsense'`` or ``'webcam'``
+            index  : int | None – webcam index, or None for RealSense
+            serial : str | None – RealSense serial, or None for webcams
+        """
+        cameras: list = []
+
+        # Discover RealSense devices
+        if _HAS_REALSENSE:
+            try:
+                ctx = rs.context()
+                for dev in ctx.devices:
+                    name = dev.get_info(rs.camera_info.name)
+                    serial = dev.get_info(rs.camera_info.serial_number)
+                    cameras.append({
+                        "label": f"{name} (Depth)",
+                        "type": "realsense",
+                        "index": None,
+                        "serial": serial,
+                    })
+            except Exception:
+                pass
+
+        # Offer webcam indices 0-9
+        for i in range(10):
+            cameras.append({
+                "label": f"Webcam {i}",
+                "type": "webcam",
+                "index": i,
+                "serial": None,
+            })
+
+        return cameras
 
     # ── RealSense initialisation ────────────────────────────────────
 
-    def _init_realsense(self, w: int, h: int, fps: int) -> None:
+    def _init_realsense(
+        self, w: int, h: int, fps: int, serial: Optional[str] = None,
+    ) -> None:
         pipe = rs.pipeline()
         cfg = rs.config()
+        if serial:
+            cfg.enable_device(serial)
         cfg.enable_stream(rs.stream.color, w, h, rs.format.bgr8, fps)
         cfg.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
         pipe.start(cfg)
@@ -124,7 +175,8 @@ class DualStreamCamera:
         self._rs_align = rs.align(rs.stream.color)
         self._using_realsense = True
         self._opened = True
-        print(f"[FALCON] RealSense camera active: {w}x{h} @ {fps}FPS")
+        label = f" (S/N {serial})" if serial else ""
+        print(f"[FALCON] RealSense camera active{label}: {w}x{h} @ {fps}FPS")
 
     # ── Webcam fallback ─────────────────────────────────────────────
 
@@ -209,12 +261,17 @@ class DualStreamCamera:
 
     def _read_realsense(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         try:
-            frames = self._rs_pipeline.wait_for_frames(timeout_ms=100)
-        except Exception:
+            frames = self._rs_pipeline.wait_for_frames(timeout_ms=200)
+        except Exception as exc:
+            print(f"[FALCON] RealSense frame timeout: {exc}")
             return None, None
-        aligned = self._rs_align.process(frames)
-        color_frame = aligned.get_color_frame()
-        depth_frame = aligned.get_depth_frame()
+        try:
+            aligned = self._rs_align.process(frames)
+            color_frame = aligned.get_color_frame()
+            depth_frame = aligned.get_depth_frame()
+        except Exception as exc:
+            print(f"[FALCON] RealSense align error: {exc}")
+            return None, None
         if not color_frame:
             return None, None
         color = np.asanyarray(color_frame.get_data())

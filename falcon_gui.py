@@ -28,6 +28,9 @@ from occlusion import OcclusionState
 from tracking import TrackingManager
 from camera_stream import DualStreamCamera
 
+# Discover available cameras once at import time
+_CAMERA_LIST = DualStreamCamera.discover_cameras()
+
 # ── Model catalogue ─────────────────────────────────────────────────
 
 MODEL_OPTIONS = {
@@ -346,12 +349,25 @@ class VisionPipeline:
 
     # ── webcam ───────────────────────────────────────────────────────
 
-    def open_camera(self, index: int = 0) -> bool:
+    def open_camera(self, cam_descriptor: dict) -> bool:
         """
-        Open a DualStreamCamera (RealSense with webcam fallback).
+        Open a DualStreamCamera based on a camera descriptor from
+        ``DualStreamCamera.discover_cameras()``.
         """
-        print(f"[FALCON] Attempting to open camera {index}...")
-        self._webcam = DualStreamCamera(webcam_index=index)
+        # Ensure any previous camera is released first
+        self.close_camera()
+
+        is_rs = cam_descriptor["type"] == "realsense"
+        idx = cam_descriptor.get("index", 0) or 0
+        serial = cam_descriptor.get("serial")
+        label = cam_descriptor["label"]
+        print(f"[FALCON] Opening camera: {label}")
+
+        self._webcam = DualStreamCamera(
+            webcam_index=idx,
+            use_realsense=is_rs,
+            realsense_serial=serial,
+        )
         return self._webcam.is_opened()
 
     def close_camera(self):
@@ -725,13 +741,18 @@ class FalconGUI:
         self.model_desc_label.grid(row=4, column=0, sticky="w", pady=(0, 10))
         model_cb.bind("<<ComboboxSelected>>", self._on_model_changed)
 
-        # ── Webcam index ────────────────────────────────────────────
-        ttk.Label(ctrl, text="Webcam Index:").grid(
+        # ── Camera selection ──────────────────────────────────────────
+        ttk.Label(ctrl, text="Camera:").grid(
             row=5, column=0, sticky="w", pady=(0, 2))
 
-        self.cam_var = tk.StringVar(value="0")
-        cam_entry = ttk.Entry(ctrl, textvariable=self.cam_var, width=6)
-        cam_entry.grid(row=6, column=0, sticky="w", pady=(0, 12))
+        cam_labels = [c["label"] for c in _CAMERA_LIST]
+        self.cam_var = tk.StringVar(value=cam_labels[0] if cam_labels else "Webcam 0")
+        cam_cb = ttk.Combobox(
+            ctrl, textvariable=self.cam_var,
+            values=cam_labels,
+            state="readonly", width=28,
+        )
+        cam_cb.grid(row=6, column=0, sticky="ew", pady=(0, 12))
 
         # ── Start / Stop ────────────────────────────────────────────
         btn_frame = ttk.Frame(ctrl)
@@ -803,14 +824,15 @@ class FalconGUI:
             self.status_var.set(f"Error: {err}")
             return
 
-        # Open camera
-        try:
-            cam_idx = int(self.cam_var.get())
-        except ValueError:
-            cam_idx = 0
+        # Open camera from dropdown selection
+        cam_label = self.cam_var.get()
+        cam_desc = next(
+            (c for c in _CAMERA_LIST if c["label"] == cam_label),
+            {"label": "Webcam 0", "type": "webcam", "index": 0, "serial": None},
+        )
 
-        if not self.pipeline.open_camera(cam_idx):
-            self.status_var.set("Error: Cannot open webcam")
+        if not self.pipeline.open_camera(cam_desc):
+            self.status_var.set("Error: Cannot open camera")
             return
 
         # Sync toggle state
