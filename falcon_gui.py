@@ -498,7 +498,7 @@ class VisionPipeline:
         return np.empty((0, 4)), np.empty(0), None
 
     def _detect_yolo(self, frame):
-        results = self.model(frame, verbose=False, half=self._yolo_half)
+        results = self.model(frame, verbose=False, half=self._yolo_half, imgsz=320)
         result = results[0]
 
         det_boxes = np.empty((0, 4))
@@ -651,7 +651,7 @@ class FalconGUI:
     └───────────────────────┴────────────────────────┘
     """
 
-    REFRESH_MS = 30  # ~33 FPS GUI refresh
+    REFRESH_MS = 33  # 30 FPS GUI refresh
 
     def __init__(self):
         self.pipeline = VisionPipeline()

@@ -275,14 +275,50 @@ class DualStreamCamera:
     # ── start / stop ────────────────────────────────────────────────
 
     def start(self) -> "DualStreamCamera":
-        """Start capturing.  For webcam mode this launches the reader thread."""
-        if self._using_realsense:
-            # RealSense pipeline is already active from __init__
-            return self
+        """Start capturing.  Launches a reader thread for both RS and webcam."""
         self._running = True
-        self._thread = threading.Thread(target=self._webcam_reader, daemon=True)
+        if self._using_realsense:
+            self._q = queue.Queue(maxsize=self._q_size)
+            self._thread = threading.Thread(
+                target=self._realsense_reader, daemon=True,
+            )
+        else:
+            self._thread = threading.Thread(
+                target=self._webcam_reader, daemon=True,
+            )
         self._thread.start()
         return self
+
+    def _realsense_reader(self) -> None:
+        """Continuously fetch RealSense frames into the shared queue."""
+        while self._running:
+            try:
+                frames = self._rs_pipeline.wait_for_frames(timeout_ms=200)
+            except Exception:
+                continue
+            try:
+                aligned = self._rs_align.process(frames)
+                color_frame = aligned.get_color_frame()
+                depth_frame = aligned.get_depth_frame()
+            except Exception:
+                continue
+            if not color_frame:
+                continue
+
+            if depth_frame:
+                depth_frame = self._rs_spatial.process(depth_frame)
+                depth_frame = self._rs_temporal.process(depth_frame)
+                depth_frame = self._rs_hole_fill.process(depth_frame)
+
+            color = np.asanyarray(color_frame.get_data())
+            depth = np.asanyarray(depth_frame.get_data()) if depth_frame else None
+
+            if self._q.full():
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    pass
+            self._q.put((color, depth))
 
     def _webcam_reader(self) -> None:
         while self._running:
@@ -320,29 +356,9 @@ class DualStreamCamera:
 
     def _read_realsense(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         try:
-            frames = self._rs_pipeline.wait_for_frames(timeout_ms=200)
-        except Exception as exc:
-            print(f"[FALCON] RealSense frame timeout: {exc}")
+            return self._q.get(timeout=0.02)
+        except queue.Empty:
             return None, None
-        try:
-            aligned = self._rs_align.process(frames)
-            color_frame = aligned.get_color_frame()
-            depth_frame = aligned.get_depth_frame()
-        except Exception as exc:
-            print(f"[FALCON] RealSense align error: {exc}")
-            return None, None
-        if not color_frame:
-            return None, None
-
-        # Apply post-processing filters to the depth frame
-        if depth_frame:
-            depth_frame = self._rs_spatial.process(depth_frame)
-            depth_frame = self._rs_temporal.process(depth_frame)
-            depth_frame = self._rs_hole_fill.process(depth_frame)
-
-        color = np.asanyarray(color_frame.get_data())
-        depth = np.asanyarray(depth_frame.get_data()) if depth_frame else None
-        return color, depth
 
     def _read_webcam(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         try:
@@ -354,6 +370,10 @@ class DualStreamCamera:
     # ── cleanup ─────────────────────────────────────────────────────
 
     def stop(self) -> None:
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
         if self._using_realsense:
             if self._rs_pipeline is not None:
                 try:
@@ -362,10 +382,6 @@ class DualStreamCamera:
                     pass
                 self._rs_pipeline = None
         else:
-            self._running = False
-            if self._thread is not None:
-                self._thread.join(timeout=2.0)
-                self._thread = None
             if self._cap is not None:
                 self._cap.release()
                 self._cap = None
