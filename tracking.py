@@ -1,11 +1,12 @@
 """
-F.A.L.C.O.N. – IoU-Based Person Tracking Module
-=================================================
+F.A.L.C.O.N. – Appearance-Aware Person Tracking Module
+========================================================
 
-Maintains persistent person IDs across video frames using Intersection-over-Union
-(IoU) matching between predicted and detected bounding boxes.  Each tracked person
-carries a short history of bounding boxes / keypoints, an occlusion state, and a
-Kalman-filter predictor that is used when detection is temporarily lost.
+Maintains persistent person IDs across video frames using a hybrid
+IoU + colour-histogram matching score.  Each tracked person carries a
+short history of bounding boxes / keypoints, an HSV colour histogram for
+re-identification, a relative skeleton for ghost-pose reconstruction,
+an occlusion state, and a 7D Kalman-filter predictor.
 
 Key classes
 -----------
@@ -19,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import cv2
 import numpy as np
 
 from occlusion import OcclusionAnalyzer, OcclusionState
@@ -43,6 +45,34 @@ def iou(boxA: np.ndarray, boxB: np.ndarray) -> float:
     return inter / (areaA + areaB - inter + 1e-6)
 
 
+def _compute_histogram(frame: np.ndarray, bbox: np.ndarray) -> Optional[np.ndarray]:
+    """Extract a normalised HSV colour histogram from *bbox* region of *frame*."""
+    h_frame, w_frame = frame.shape[:2]
+    x1 = max(0, int(bbox[0]))
+    y1 = max(0, int(bbox[1]))
+    x2 = min(w_frame, int(bbox[2]))
+    y2 = min(h_frame, int(bbox[3]))
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    roi = frame[y1:y2, x1:x2]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [32, 32],
+                        [0, 180, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist
+
+
+def _compare_histograms(
+    histA: Optional[np.ndarray],
+    histB: Optional[np.ndarray],
+) -> float:
+    """Return histogram correlation in [0, 1].  0 if either is None."""
+    if histA is None or histB is None:
+        return 0.0
+    score = cv2.compareHist(histA, histB, cv2.HISTCMP_CORREL)
+    return max(0.0, score)
+
+
 # ── PersonTracker dataclass ─────────────────────────────────────────
 
 @dataclass
@@ -59,6 +89,12 @@ class PersonTracker:
     keypoint_history: list = field(default_factory=list)
     max_history: int = 30
 
+    # Appearance descriptor (HSV colour histogram)
+    histogram: Optional[np.ndarray] = None
+
+    # Ghost skeleton: relative keypoint offsets from bbox centre
+    relative_skeleton: Optional[np.ndarray] = None  # (17, 3) offsets
+
     # Occlusion & prediction
     occlusion_state: OcclusionState = OcclusionState.VISIBLE
     predictor: KalmanPredictor = field(default_factory=KalmanPredictor)
@@ -73,8 +109,11 @@ class PersonTracker:
 
     # Recovery tracking
     is_recovered: bool = False
-    recovery_frames_remaining: int = 0       # countdown from recovery_duration → 0
-    was_occluded: bool = False                # True while in any occluded state
+    recovery_frames_remaining: int = 0
+    was_occluded: bool = False
+
+    # Kalman innovation (prediction-vs-measurement error)
+    tracking_error: float = 0.0
 
     # ── helpers ──────────────────────────────────────────────────────
 
@@ -104,23 +143,50 @@ class PersonTracker:
             self.bbox[3] - self.bbox[1],
         ])
 
+    def update_relative_skeleton(self) -> None:
+        """Cache keypoint offsets relative to the bbox centre."""
+        if self.keypoints is None:
+            return
+        cx, cy = self.center
+        rel = self.keypoints.copy()
+        rel[:, 0] -= cx
+        rel[:, 1] -= cy
+        # confidence column is kept as-is
+        self.relative_skeleton = rel
+
+    def reconstruct_ghost_keypoints(self) -> Optional[np.ndarray]:
+        """Reconstruct keypoints from Kalman-predicted centre + stored offsets."""
+        if self.relative_skeleton is None:
+            return None
+        pred_center = self.predictor.get_state_position()
+        if pred_center is None:
+            pred_center = self.center
+        ghost = self.relative_skeleton.copy()
+        ghost[:, 0] += pred_center[0]
+        ghost[:, 1] += pred_center[1]
+        return ghost
+
 
 # ── TrackingManager ─────────────────────────────────────────────────
 
 class TrackingManager:
     """
     Frame-level tracker that associates new detections with existing
-    tracks via IoU matching, manages track lifecycles, and delegates
-    occlusion classification.
+    tracks via a weighted IoU + histogram-correlation score, manages
+    track lifecycles, and delegates occlusion classification.
 
     Parameters
     ----------
     iou_threshold : float
-        Minimum IoU to associate a detection with a track (default 0.3).
+        Minimum combined score to associate a detection with a track.
     max_frames_lost : int
-        Number of frames without detection before a track is removed (default 30).
+        Frames without detection before a track is removed.
     prediction_decay : float
         Multiplicative decay applied to prediction_confidence each missed frame.
+    iou_weight : float
+        Weight for IoU component in the cost matrix (default 0.5).
+    hist_weight : float
+        Weight for histogram correlation component (default 0.5).
     """
 
     def __init__(
@@ -129,15 +195,26 @@ class TrackingManager:
         max_frames_lost: int = 20,
         prediction_decay: float = 0.90,
         recovery_duration: int = 20,
+        iou_weight: float = 0.5,
+        hist_weight: float = 0.5,
     ):
         self.iou_threshold = iou_threshold
         self.max_frames_lost = max_frames_lost
         self.prediction_decay = prediction_decay
-        self.recovery_duration = recovery_duration   # frames to hold RECOVERED tag (~3 s)
+        self.recovery_duration = recovery_duration
+        self.iou_weight = iou_weight
+        self.hist_weight = hist_weight
 
         self._next_id: int = 1
         self.tracks: List[PersonTracker] = []
         self.occlusion_analyzer = OcclusionAnalyzer()
+
+    @property
+    def max_tracking_error(self) -> float:
+        """Return the largest tracking_error across all active tracks."""
+        if not self.tracks:
+            return 0.0
+        return max(t.tracking_error for t in self.tracks)
 
     # ── public API ───────────────────────────────────────────────────
 
@@ -146,6 +223,7 @@ class TrackingManager:
         det_boxes: np.ndarray,
         det_keypoints: Optional[np.ndarray] = None,
         det_confs: Optional[np.ndarray] = None,
+        frame: Optional[np.ndarray] = None,
     ) -> List[PersonTracker]:
         """
         Process one frame of detections and return all active tracks.
@@ -158,6 +236,8 @@ class TrackingManager:
             Detected keypoints with confidence per keypoint.
         det_confs : ndarray | None, shape (N,)
             Detection-level confidence scores.
+        frame : ndarray | None
+            Raw BGR frame used to compute appearance histograms.
 
         Returns
         -------
@@ -169,22 +249,34 @@ class TrackingManager:
         if det_confs is None:
             det_confs = np.ones(len(det_boxes))
 
+        # Pre-compute histograms for each detection
+        det_hists: List[Optional[np.ndarray]] = []
+        for d_idx in range(len(det_boxes)):
+            if frame is not None:
+                det_hists.append(_compute_histogram(frame, det_boxes[d_idx]))
+            else:
+                det_hists.append(None)
+
         # 1. Predict step for every existing track
         self._predict_all()
 
         # 2. Match detections ↔ tracks
-        matched, unmatched_dets, unmatched_tracks = self._match_detections(det_boxes)
+        matched, unmatched_dets, unmatched_tracks = self._match_detections(
+            det_boxes, det_hists,
+        )
 
         # 3. Update matched tracks
         for t_idx, d_idx in matched:
             track = self.tracks[t_idx]
             kps = det_keypoints[d_idx] if det_keypoints is not None else None
-            self._update_track(track, det_boxes[d_idx], kps, det_confs[d_idx])
+            self._update_track(track, det_boxes[d_idx], kps, det_confs[d_idx],
+                               det_hists[d_idx])
 
         # 4. Create new tracks for unmatched detections
         for d_idx in unmatched_dets:
             kps = det_keypoints[d_idx] if det_keypoints is not None else None
-            self._create_track(det_boxes[d_idx], kps, det_confs[d_idx])
+            self._create_track(det_boxes[d_idx], kps, det_confs[d_idx],
+                               det_hists[d_idx])
 
         # 5. Handle unmatched (lost) tracks – rely on prediction
         for t_idx in unmatched_tracks:
@@ -192,29 +284,39 @@ class TrackingManager:
             track.frames_since_detection += 1
             track.is_predicted = True
             track.prediction_confidence *= self.prediction_decay
-            # Use predicted bbox from Kalman
-            pred_center = track.predictor.get_state_position()
-            if pred_center is not None and track.last_bbox_size is not None:
-                w, h = track.last_bbox_size
-                track.bbox = np.array([
-                    pred_center[0] - w / 2,
-                    pred_center[1] - h / 2,
-                    pred_center[0] + w / 2,
-                    pred_center[1] + h / 2,
-                ])
+
+            # Use 7D Kalman predicted bbox (dynamic scale)
+            pred_bbox = track.predictor.get_state_bbox()
+            if pred_bbox is not None:
+                track.bbox = pred_bbox
+            else:
+                pred_center = track.predictor.get_state_position()
+                if pred_center is not None and track.last_bbox_size is not None:
+                    w, h = track.last_bbox_size
+                    track.bbox = np.array([
+                        pred_center[0] - w / 2,
+                        pred_center[1] - h / 2,
+                        pred_center[0] + w / 2,
+                        pred_center[1] + h / 2,
+                    ])
+
+            # Reconstruct ghost keypoints for occluded tracks
+            ghost_kp = track.reconstruct_ghost_keypoints()
+            if ghost_kp is not None:
+                track.keypoints = ghost_kp
+
             track.push_history()
             track.total_frames_tracked += 1
 
         # 6. Classify occlusion for every track + recovery bookkeeping
         for track in self.tracks:
             raw_state = self.occlusion_analyzer.analyze(
-                keypoints=track.keypoints,
+                keypoints=track.keypoints if not track.is_predicted else None,
                 bbox=track.bbox,
                 detection_confidence=track.detection_conf,
                 frames_since_detection=track.frames_since_detection,
             )
 
-            # Mark was_occluded flag for future recovery detection
             if raw_state in (
                 OcclusionState.PARTIALLY_OCCLUDED,
                 OcclusionState.HEAVILY_OCCLUDED,
@@ -222,18 +324,15 @@ class TrackingManager:
             ):
                 track.was_occluded = True
 
-            # If currently in recovery window, override state
             if track.is_recovered and track.recovery_frames_remaining > 0:
                 track.occlusion_state = OcclusionState.RECOVERED
                 track.recovery_frames_remaining -= 1
-                # Once countdown expires, transition to normal VISIBLE
                 if track.recovery_frames_remaining <= 0:
                     track.is_recovered = False
                     track.was_occluded = False
                     track.occlusion_state = OcclusionState.VISIBLE
             else:
                 track.occlusion_state = raw_state
-                # If no longer occluded and not recovered, clear flag
                 if raw_state == OcclusionState.VISIBLE:
                     track.was_occluded = False
 
@@ -250,10 +349,12 @@ class TrackingManager:
             track.predictor.predict()
 
     def _match_detections(
-        self, det_boxes: np.ndarray
+        self,
+        det_boxes: np.ndarray,
+        det_hists: List[Optional[np.ndarray]],
     ) -> Tuple[list, list, list]:
         """
-        Greedy IoU matching (highest IoU first).
+        Greedy matching using weighted IoU + histogram correlation.
 
         Returns (matched_pairs, unmatched_det_indices, unmatched_track_indices).
         """
@@ -265,24 +366,28 @@ class TrackingManager:
         if n_dets == 0:
             return [], [], list(range(n_tracks))
 
-        # Build IoU cost matrix
+        # Build combined cost matrix
         cost = np.zeros((n_tracks, n_dets), dtype=np.float32)
         for t in range(n_tracks):
             t_box = self.tracks[t].bbox
+            t_hist = self.tracks[t].histogram
             for d in range(n_dets):
-                cost[t, d] = iou(t_box, det_boxes[d])
+                iou_score = iou(t_box, det_boxes[d])
+                hist_score = _compare_histograms(t_hist, det_hists[d])
+                cost[t, d] = (self.iou_weight * iou_score
+                              + self.hist_weight * hist_score)
 
         matched: list = []
         used_tracks: set = set()
         used_dets: set = set()
 
-        # Greedy: pick highest IoU pair repeatedly
+        # Greedy: pick highest combined score repeatedly
         while True:
             if cost.size == 0:
                 break
             best = np.unravel_index(np.argmax(cost), cost.shape)
-            best_iou = cost[best]
-            if best_iou < self.iou_threshold:
+            best_score = cost[best]
+            if best_score < self.iou_threshold:
                 break
             t_idx, d_idx = int(best[0]), int(best[1])
             matched.append((t_idx, d_idx))
@@ -301,10 +406,10 @@ class TrackingManager:
         bbox: np.ndarray,
         keypoints: Optional[np.ndarray],
         conf: float,
+        histogram: Optional[np.ndarray] = None,
     ) -> None:
         """Update an existing track with a matched detection."""
         # ── Recovery detection ───────────────────────────────────────
-        # If the person was occluded and is now detected again → RECOVERED
         if track.was_occluded and track.frames_since_detection > 0:
             track.is_recovered = True
             track.recovery_frames_remaining = self.recovery_duration
@@ -318,8 +423,34 @@ class TrackingManager:
         track.last_seen_time = time.time()
         track.last_bbox_size = track.bbox_wh.copy()
 
-        # Kalman update with measured center
-        track.predictor.update(track.center)
+        # Update appearance histogram (EMA blend for stability)
+        if histogram is not None:
+            if track.histogram is not None:
+                track.histogram = 0.7 * track.histogram + 0.3 * histogram
+                cv2.normalize(track.histogram, track.histogram)
+            else:
+                track.histogram = histogram
+
+        # Update relative skeleton offsets
+        track.update_relative_skeleton()
+
+        # Kalman update with full measurement [cx, cy, s, r]
+        w, h = track.bbox_wh
+        s = float(w * h)           # area (scale)
+        r = float(w / h) if h > 0 else 1.0   # aspect ratio
+        measurement = np.array([track.center[0], track.center[1], s, r])
+
+        # Compute innovation (prediction error) before correction
+        pred_pos = track.predictor.get_state_position()
+        if pred_pos is not None:
+            track.tracking_error = float(np.linalg.norm(
+                measurement[:2] - pred_pos
+            ))
+        else:
+            track.tracking_error = 0.0
+
+        track.predictor.update(measurement)
+
         track.push_history()
         track.total_frames_tracked += 1
 
@@ -328,6 +459,7 @@ class TrackingManager:
         bbox: np.ndarray,
         keypoints: Optional[np.ndarray],
         conf: float,
+        histogram: Optional[np.ndarray] = None,
     ) -> PersonTracker:
         """Spawn a new track from an unmatched detection."""
         track = PersonTracker(
@@ -335,12 +467,20 @@ class TrackingManager:
             bbox=bbox.copy(),
             keypoints=keypoints.copy() if keypoints is not None else None,
             detection_conf=conf,
+            histogram=histogram,
         )
         track.last_bbox_size = track.bbox_wh.copy()
         self._next_id += 1
 
-        # Initialise Kalman with first measured center
-        track.predictor.init_state(track.center)
+        # Cache relative skeleton
+        track.update_relative_skeleton()
+
+        # Initialise 7D Kalman with first measurement
+        w, h = track.bbox_wh
+        s = float(w * h)
+        r = float(w / h) if h > 0 else 1.0
+        track.predictor.init_state(track.center, scale=s, aspect=r)
+
         track.push_history()
         track.total_frames_tracked = 1
         self.tracks.append(track)
@@ -352,3 +492,39 @@ class TrackingManager:
             t for t in self.tracks
             if t.frames_since_detection <= self.max_frames_lost
         ]
+
+    # ── lightweight predict-only pass (for frame-skipping) ───────────
+
+    def propagate_only(self) -> List[PersonTracker]:
+        """Advance all tracks by one Kalman predict step without detection.
+
+        Used on skipped frames to keep bounding boxes and ghost skeletons
+        up-to-date while avoiding the cost of running the detector.
+        """
+        for track in self.tracks:
+            track.predictor.predict()
+
+            # Update bbox from Kalman state
+            pred_bbox = track.predictor.get_state_bbox()
+            if pred_bbox is not None:
+                track.bbox = pred_bbox
+            elif track.last_bbox_size is not None:
+                pred_center = track.predictor.get_state_position()
+                if pred_center is not None:
+                    w, h = track.last_bbox_size
+                    track.bbox = np.array([
+                        pred_center[0] - w / 2,
+                        pred_center[1] - h / 2,
+                        pred_center[0] + w / 2,
+                        pred_center[1] + h / 2,
+                    ])
+
+            # Reconstruct ghost keypoints so the skeleton stays current
+            ghost_kp = track.reconstruct_ghost_keypoints()
+            if ghost_kp is not None:
+                track.keypoints = ghost_kp
+
+            track.push_history()
+            track.total_frames_tracked += 1
+
+        return list(self.tracks)

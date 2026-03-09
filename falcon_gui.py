@@ -2,18 +2,19 @@
 F.A.L.C.O.N. Vision System – Tkinter GUI Entry Point
 ======================================================
 
-Wraps the existing vision pipeline (tracking, occlusion, prediction,
-radar) in a lightweight Tkinter GUI with:
+Wraps the existing vision pipeline (tracking, occlusion, prediction)
+in a lightweight Tkinter GUI with:
 
 * Model selection dropdown  (YOLO26 Nano / YOLO26 Large / MediaPipe Pose)
 * Start / Stop controls
-* Live toggle switches      (skeleton, radar, Kalman predictions)
+* Live toggle switches      (skeleton, Kalman predictions)
 * Embedded OpenCV video feed rendered inside a Tkinter Label
 * Background threading so the GUI never freezes
 """
 
 from __future__ import annotations
 
+import queue
 import sys
 import threading
 import time
@@ -26,7 +27,6 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from occlusion import OcclusionState
-from radar import CameraProjection, MockRadar
 from tracking import TrackingManager
 
 # ── Model catalogue ─────────────────────────────────────────────────
@@ -186,16 +186,102 @@ def _draw_skeleton(img, keypoints, colour, conf_thresh=0.4):
             cv2.circle(img, (int(kx), int(ky)), 4, colour, -1, cv2.LINE_AA)
 
 
+def _draw_ghost_skeleton(img, keypoints, conf_thresh=0.3, dash_len=8):
+    """Draw a semi-transparent dashed skeleton for predicted (ghost) poses."""
+    if keypoints is None:
+        return
+    ghost_colour = (200, 200, 100)  # light cyan/gray in BGR
+    # Semi-transparent overlay
+    overlay = img.copy()
+    for (i, j) in SKELETON_CONNECTIONS:
+        if i >= len(keypoints) or j >= len(keypoints):
+            continue
+        xi, yi, ci = keypoints[i]
+        xj, yj, cj = keypoints[j]
+        if ci > conf_thresh and cj > conf_thresh:
+            # Dashed limb
+            p1 = np.array([xi, yi])
+            p2 = np.array([xj, yj])
+            dist = int(np.linalg.norm(p2 - p1))
+            n_pts = max(dist // dash_len, 2)
+            xs = np.linspace(xi, xj, n_pts).astype(int)
+            ys = np.linspace(yi, yj, n_pts).astype(int)
+            for k in range(0, len(xs) - 1, 2):
+                cv2.line(overlay, (xs[k], ys[k]),
+                         (xs[k + 1], ys[k + 1]), ghost_colour, 2, cv2.LINE_AA)
+    # Ghost keypoint dots (hollow circles)
+    for kp_idx in range(len(keypoints)):
+        kx, ky, kc = keypoints[kp_idx]
+        if kc > conf_thresh:
+            cv2.circle(overlay, (int(kx), int(ky)), 4, ghost_colour, 1, cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.5, img, 0.5, 0, img)
+
+
+# ── Asynchronous Webcam Capture ──────────────────────────────────────
+
+class WebcamStream:
+    """Threaded webcam reader that decouples capture from processing."""
+
+    def __init__(self, cap: cv2.VideoCapture, q_size: int = 2):
+        self.cap = cap
+        self._q: queue.Queue = queue.Queue(maxsize=q_size)
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def is_opened(self) -> bool:
+        return self.cap.isOpened()
+
+    def start(self) -> "WebcamStream":
+        self._running = True
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+        return self
+
+    def _reader(self) -> None:
+        while self._running:
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+            # Drop oldest frame if the consumer is too slow
+            if self._q.full():
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    pass
+            self._q.put(frame)
+
+    def read(self) -> Optional[np.ndarray]:
+        """Return the latest frame or None if none available."""
+        try:
+            return self._q.get(timeout=0.02)
+        except queue.Empty:
+            return None
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        if self.cap is not None:
+            self.cap.release()
+
+
 # ── Vision Pipeline (runs in background thread) ─────────────────────
 
 class VisionPipeline:
-    """
-    Encapsulates model loading, webcam capture, detection, tracking,
-    and frame annotation.  Designed to run in a background thread.
-    """
+    """Encapsulates model loading, webcam capture, detection, tracking,
+    and frame annotation.  Designed to run in a background thread."""
 
-    def __init__(self):
-        self.cap: Optional[cv2.VideoCapture] = None
+    # Adaptive skip-rate parameters
+    SKIP_MAX: int = 3            # cruise skip rate (low error)
+    SKIP_MID: int = 2            # moderate movement
+    SKIP_NONE: int = 1           # every frame (high error)
+    ERROR_HIGH: float = 30.0     # px – triggers full-detect burst
+    ERROR_LOW: float = 10.0      # px – allows relaxed skipping
+    BURST_LENGTH: int = 8        # consecutive full-detect frames after spike
+
+    def __init__(self, skip_frames: int = 2):
+        self._webcam: Optional[WebcamStream] = None
         self.model = None
         self.mp_pose = None              # MediaPipe Pose instance
         self.backend: str = "yolo"       # "yolo" or "mediapipe"
@@ -206,12 +292,14 @@ class VisionPipeline:
             prediction_decay=0.90,
             recovery_duration=90,
         )
-        self.mock_radar = MockRadar()
-        self.cam_proj = CameraProjection()
+
+        # Adaptive frame-skipping state
+        self.skip_frames = skip_frames
+        self._skip_counter = 0
+        self._burst_remaining = 0        # frames left in force-detect burst
 
         # Toggles (read by the render loop, written by the GUI)
         self.show_skeleton = True
-        self.show_radar = True
         self.show_predictions = True
 
         # Thread control
@@ -317,80 +405,60 @@ class VisionPipeline:
 
     def open_camera(self, index: int = 0) -> bool:
         """
-        Opens camera with optimized settings.
-        Attempt 1: GStreamer (best for CSI cameras on Jetson)
-        Attempt 2: V4L2 with MJPG (best for USB cameras)
+        Opens camera with optimized OS-aware settings, then passes the 
+        configured object to the WebcamStream thread.
         """
         print(f"[FALCON] Attempting to open camera {index}...")
 
-        # 1. Try GStreamer pipeline (Standard for Jetson CSI cameras like IMX219)
-        # This pipeline converts NVMM (hardware memory) to BGR for OpenCV
-        gst_str = (
-            f"nvarguscamerasrc sensor-id={index} ! "
-            "video/x-raw(memory:NVMM), width=1280, height=720, format=NV12, framerate=30/1 ! "
-            "nvvidconv flip-method=0 ! "
-            "video/x-raw, width=640, height=480, format=BGRx ! "
-            "videoconvert ! "
-            "video/x-raw, format=BGR ! appsink drop=1"
-        )
-        
-        try:
-            # We only try GStreamer if it looks like we might be on a Jetson with CSI
-            # But since user is having issues, we can try opening default first, 
-            # and if that's slow/bad, checking capabilities.
-            # actually, let's stick to the V4L2 fix first which is safer for index 0
-            pass 
-        except:
-            pass
+        if sys.platform == "linux":
+            # Linux / Jetson Optimizations
+            # Try V4L2 with FORCE MJPG first (fixes 8-15 FPS USB issues)
+            cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(index)
+        elif sys.platform == "win32":
+            # Windows Optimizations (DSHOW is safer and faster on windows)
+            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(index)
+        else:
+            cap = cv2.VideoCapture(index)
 
-        # 2. Standard V4L2 (USB) with FORCE MJPG
-        # This fixes the 8 FPS / 15 FPS limit on most USB cams
-        self.cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
-        
-        if not self.cap.isOpened():
-            # Fallback to default backend if V4L2 fails
-            self.cap = cv2.VideoCapture(index)
-
-        if self.cap.isOpened():
+        if cap.isOpened():
             # Force MJPG - Critical for USB 2.0/3.0 bandwidth
             fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-            self.cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+            cap.set(cv2.CAP_PROP_FOURCC, fourcc)
             
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            self.cap.set(cv2.CAP_PROP_FPS, 30)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
 
-            # Logitech C270 specifc settings for 30FPS
-            # 1 = Manual Exposure, 3 = Auto Exposure (V4L2 standard)
-            # 0.25 is sometimes used in older bindings, but 1 is usually safer.
+            # Logitech C270 / General manual exposure settings for 30FPS
             try:
                 # Disable auto exposure
-                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) 
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) 
                 
                 # Set manual exposure value (100-200 is typical for 30fps indoor)
-                # 450 dropped FPS to 22. Dialing back to safe 30fps range.
-                # Try 150-300 range.
-                self.cap.set(cv2.CAP_PROP_EXPOSURE, 320)
+                cap.set(cv2.CAP_PROP_EXPOSURE, 320)
                 
                 # Boost Gain heavily to compensate for lower exposure time
-                # Max gain is usually around 255. Bumping up from 128 -> 200.
-                self.cap.set(cv2.CAP_PROP_GAIN, 200)
-            except:
+                cap.set(cv2.CAP_PROP_GAIN, 200)
+            except Exception:
                 pass
             
             # Logging actual obtained settings
-            actual_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-            actual_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-            actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
-            mode = self.cap.get(cv2.CAP_PROP_FOURCC)
+            actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            actual_fps = cap.get(cv2.CAP_PROP_FPS)
             print(f"[FALCON] Camera {index} active: {actual_w}x{actual_h} @ {actual_fps}FPS")
             
-        return self.cap.isOpened()
+        self._webcam = WebcamStream(cap=cap)
+        return self._webcam.is_opened()
 
     def close_camera(self):
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
+        if self._webcam is not None:
+            self._webcam.stop()
+            self._webcam = None
 
     # ── start / stop ─────────────────────────────────────────────────
 
@@ -398,15 +466,18 @@ class VisionPipeline:
         if self._running:
             return
         self._running = True
-        # Reset tracker state for a fresh session
         self.tracker = TrackingManager(
             iou_threshold=0.3,
             max_frames_lost=90,
             prediction_decay=0.90,
             recovery_duration=90,
         )
+        self._skip_counter = 0
+        self._burst_remaining = 0
         self._fps_timer = time.time()
         self._frame_count = 0
+        if self._webcam is not None:
+            self._webcam.start()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -435,22 +506,48 @@ class VisionPipeline:
 
     def _loop(self):
         while self._running:
-            if self.cap is None or not self.cap.isOpened():
+            if self._webcam is None:
                 time.sleep(0.01)
                 continue
 
-            ret, frame = self.cap.read()
-            if not ret:
-                time.sleep(0.01)
+            frame = self._webcam.read()
+            if frame is None:
                 continue
 
             h_frame, w_frame = frame.shape[:2]
+            self._skip_counter += 1
 
-            # ── detection ────────────────────────────────────────────
-            det_boxes, det_confs, det_keypoints = self._detect(frame, w_frame, h_frame)
+            # Decide whether to run the detector this frame
+            run_detect = (
+                self._burst_remaining > 0
+                or self._skip_counter % self.skip_frames == 0
+            )
 
-            # ── tracking ─────────────────────────────────────────────
-            tracks = self.tracker.update(det_boxes, det_keypoints, det_confs)
+            if run_detect:
+                # ── full detection frame ─────────────────────────────
+                det_boxes, det_confs, det_keypoints = self._detect(
+                    frame, w_frame, h_frame,
+                )
+                tracks = self.tracker.update(
+                    det_boxes, det_keypoints, det_confs, frame=frame,
+                )
+
+                # ── adaptive skip-rate adjustment ────────────────────
+                err = self.tracker.max_tracking_error
+                if err >= self.ERROR_HIGH:
+                    # Spike detected – force detection on every frame
+                    self._burst_remaining = self.BURST_LENGTH
+                    self.skip_frames = self.SKIP_NONE
+                elif err <= self.ERROR_LOW:
+                    self.skip_frames = self.SKIP_MAX
+                else:
+                    self.skip_frames = self.SKIP_MID
+
+                if self._burst_remaining > 0:
+                    self._burst_remaining -= 1
+            else:
+                # ── skipped frame: Kalman propagate only ─────────────
+                tracks = self.tracker.propagate_only()
 
             # ── annotate ─────────────────────────────────────────────
             vis = frame.copy()
@@ -539,7 +636,6 @@ class VisionPipeline:
         n_occluded = 0
         n_predicted = 0
         n_recovered = 0
-        radar_active = False
         h_frame, w_frame = vis.shape[:2]
 
         for t in tracks:
@@ -555,6 +651,9 @@ class VisionPipeline:
                     sig_x, sig_y = t.predictor.get_uncertainty()
                     cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
                     _draw_uncertainty_ellipse(vis, (cx, cy), sig_x, sig_y, colour)
+                    # Draw ghost skeleton for predicted tracks
+                    if self.show_skeleton and t.keypoints is not None:
+                        _draw_ghost_skeleton(vis, t.keypoints)
                 label = f"Person #{t.track_id} (PRED {t.prediction_confidence:.0%})"
                 n_predicted += 1
 
@@ -579,36 +678,12 @@ class VisionPipeline:
             cv2.putText(vis, occ_label, (x1, y1 - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour, 1, cv2.LINE_AA)
 
-            # ── Radar crosshair for heavily occluded / lost ──────
-            if self.show_radar and t.occlusion_state in (
-                OcclusionState.HEAVILY_OCCLUDED,
-                OcclusionState.LOST,
-            ):
-                pt3d = self.mock_radar.get_target_3d()
-                u, v = self.cam_proj.project_3d_to_2d(pt3d)
-                if 0 <= u < w_frame and 0 <= v < h_frame:
-                    radar_colour = (255, 0, 255)
-                    cross_size = 20
-                    cv2.line(vis, (u - cross_size, v), (u + cross_size, v),
-                             radar_colour, 2, cv2.LINE_AA)
-                    cv2.line(vis, (u, v - cross_size), (u, v + cross_size),
-                             radar_colour, 2, cv2.LINE_AA)
-                    cv2.circle(vis, (u, v), cross_size, radar_colour, 2, cv2.LINE_AA)
-                    rw, rh = 40, 80
-                    cv2.rectangle(vis, (u - rw, v - rh), (u + rw, v + rh),
-                                  radar_colour, 2)
-                    cv2.putText(vis, f"RADAR TARGET #{t.track_id}",
-                                (u - rw, v - rh - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                radar_colour, 2, cv2.LINE_AA)
-
             if t.occlusion_state in (
                 OcclusionState.PARTIALLY_OCCLUDED,
                 OcclusionState.HEAVILY_OCCLUDED,
                 OcclusionState.LOST,
             ):
                 n_occluded += 1
-                radar_active = True
 
         # ── Info overlay (top-left) ─────────────────────────────────
         overlay_lines = [
@@ -623,21 +698,8 @@ class VisionPipeline:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                         (255, 255, 255), 2, cv2.LINE_AA)
 
-        # ── RADAR ACTIVE banner ─────────────────────────────────────
-        if radar_active and self.show_radar:
-            banner = "RADAR ACTIVE"
-            banner_colour = (0, 0, 255)
-            (tw, th), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
-            bx = vis.shape[1] - tw - 20
-            by = 40
-            overlay = vis.copy()
-            cv2.rectangle(overlay, (bx - 10, by - th - 10),
-                          (bx + tw + 10, by + 10), banner_colour, -1)
-            cv2.addWeighted(overlay, 0.5, vis, 0.5, 0, vis)
-            cv2.putText(vis, banner, (bx, by),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-                        (255, 255, 255), 2, cv2.LINE_AA)
-        elif not radar_active:
+        # ── Status banner ───────────────────────────────────────────
+        if n_occluded == 0:
             cv2.putText(vis, "STATE: ALL VISIBLE", (10, vis.shape[0] - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                         (0, 255, 0), 2, cv2.LINE_AA)
@@ -657,7 +719,7 @@ class FalconGUI:
     │                       │  Model: [▼ dropdown  ] │
     │                       │  [  Start  ] [ Stop  ] │
     │    Live Video Feed    │  ☑ Show Skeleton       │
-    │   (Tkinter Label)     │  ☑ Mock Radar          │
+    │   (Tkinter Label)     │                        │
     │                       │  ☑ Kalman Predictions  │
     │                       │                        │
     │                       │  FPS: --   Status: --  │
@@ -793,17 +855,11 @@ class FalconGUI:
                         command=self._sync_toggles
                         ).grid(row=10, column=0, sticky="w", pady=2)
 
-        self.radar_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ctrl, text="Enable Mock Radar",
-                        variable=self.radar_var,
-                        command=self._sync_toggles
-                        ).grid(row=11, column=0, sticky="w", pady=2)
-
         self.pred_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(ctrl, text="Show Kalman Predictions",
                         variable=self.pred_var,
                         command=self._sync_toggles
-                        ).grid(row=12, column=0, sticky="w", pady=2)
+                        ).grid(row=11, column=0, sticky="w", pady=2)
 
         # ── Status bar ──────────────────────────────────────────────
         sep2 = ttk.Separator(ctrl, orient="horizontal")
@@ -830,7 +886,6 @@ class FalconGUI:
 
     def _sync_toggles(self):
         self.pipeline.show_skeleton = self.skel_var.get()
-        self.pipeline.show_radar = self.radar_var.get()
         self.pipeline.show_predictions = self.pred_var.get()
 
     def _on_start(self):
