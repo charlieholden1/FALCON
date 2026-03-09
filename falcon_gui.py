@@ -317,6 +317,21 @@ class VisionPipeline:
 
     def open_camera(self, index: int = 0) -> bool:
         self.cap = cv2.VideoCapture(index)
+        
+        # Optimize camera settings for speed
+        if self.cap.isOpened():
+            # Try to force 30 FPS and lower resolution (640x480 is standard for YOLO)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
+            
+            # Reduce buffer size to minimize latency
+            # Note: CAP_PROP_BUFFERSIZE is not supported on all backends, but good to try
+            try:
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except:
+                pass
+                
         return self.cap.isOpened()
 
     def close_camera(self):
