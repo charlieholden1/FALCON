@@ -366,8 +366,12 @@ class VisionPipeline:
             try:
                 # Disable auto exposure
                 self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) 
+                
                 # Set manual exposure value (100-200 is typical for 30fps indoor)
-                self.cap.set(cv2.CAP_PROP_EXPOSURE, 150)
+                # If image is too dark, INCREASE this value (e.g. 200, 250, 300)
+                # If you go too high, FPS will drop back to 15.
+                # Try 250 as a balance.
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, 250)
             except:
                 pass
             
