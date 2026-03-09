@@ -372,11 +372,6 @@ class VisionPipeline:
                 pass
             
             # Logging actual obtained settings
-                self.cap.set(cv2.CAP_PROP_EXPOSURE, 0.01) 
-            except:
-                pass
-            
-            # Logging actual obtained settings
             actual_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
             actual_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
             actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
