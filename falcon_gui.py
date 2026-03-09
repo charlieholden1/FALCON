@@ -37,6 +37,11 @@ MODEL_OPTIONS = {
         "path": "yolo26n-pose.pt",
         "description": "High speed, multi-person support",
     },
+    "YOLO26 Nano (TensorRT)": {
+        "backend": "yolo",
+        "path": "yolo26n-pose.engine",
+        "description": "Optimized for Jetson (Requires export)",
+    },
     "YOLO26 Large": {
         "backend": "yolo",
         "path": "yolo26l-pose.pt",
@@ -217,8 +222,8 @@ def _draw_ghost_skeleton(img, keypoints, conf_thresh=0.3, dash_len=8):
 class WebcamStream:
     """Threaded webcam reader that decouples capture from processing."""
 
-    def __init__(self, src: int = 0, q_size: int = 2):
-        self.cap = cv2.VideoCapture(src)
+    def __init__(self, cap: cv2.VideoCapture, q_size: int = 2):
+        self.cap = cap
         self._q: queue.Queue = queue.Queue(maxsize=q_size)
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -322,8 +327,18 @@ class VisionPipeline:
 
         if self.backend == "yolo":
             try:
+                import torch
                 from ultralytics import YOLO
+
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                print(f"[FALCON] Loading YOLO model on {device.upper()}...")
+
                 self.model = YOLO(cfg["path"])
+
+                # Only move PyTorch models to device; TensorRT engines are device-bound by export
+                if not cfg["path"].endswith(".engine"):
+                    self.model.to(device)
+                
                 self.mp_pose = None
                 return ""
             except Exception as exc:
@@ -338,6 +353,17 @@ class VisionPipeline:
                     PoseLandmarkerOptions,
                     RunningMode,
                 )
+
+                # Check for GPU delegate availability (MediaPipe uses GPU delegate, not CUDA directly)
+                # Note: On Linux/Jetson, MediaPipe Python GPU support can be tricky.
+                delegate = BaseOptions.Delegate.CPU
+                try:
+                    # Attempt to use GPU delegate if available
+                    delegate = BaseOptions.Delegate.GPU
+                except AttributeError:
+                    pass
+
+                print(f"[FALCON] Loading MediaPipe model with delegate: {delegate}...")
 
                 import os
                 model_path = os.path.join(
@@ -355,7 +381,7 @@ class VisionPipeline:
                     )
 
                 options = PoseLandmarkerOptions(
-                    base_options=BaseOptions(model_asset_path=model_path),
+                    base_options=BaseOptions(model_asset_path=model_path, delegate=delegate),
                     running_mode=RunningMode.IMAGE,
                     num_poses=1,
                     min_pose_detection_confidence=0.5,
@@ -378,7 +404,55 @@ class VisionPipeline:
     # ── webcam ───────────────────────────────────────────────────────
 
     def open_camera(self, index: int = 0) -> bool:
-        self._webcam = WebcamStream(src=index)
+        """
+        Opens camera with optimized OS-aware settings, then passes the 
+        configured object to the WebcamStream thread.
+        """
+        print(f"[FALCON] Attempting to open camera {index}...")
+
+        if sys.platform == "linux":
+            # Linux / Jetson Optimizations
+            # Try V4L2 with FORCE MJPG first (fixes 8-15 FPS USB issues)
+            cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(index)
+        elif sys.platform == "win32":
+            # Windows Optimizations (DSHOW is safer and faster on windows)
+            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(index)
+        else:
+            cap = cv2.VideoCapture(index)
+
+        if cap.isOpened():
+            # Force MJPG - Critical for USB 2.0/3.0 bandwidth
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+            
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+
+            # Logitech C270 / General manual exposure settings for 30FPS
+            try:
+                # Disable auto exposure
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) 
+                
+                # Set manual exposure value (100-200 is typical for 30fps indoor)
+                cap.set(cv2.CAP_PROP_EXPOSURE, 320)
+                
+                # Boost Gain heavily to compensate for lower exposure time
+                cap.set(cv2.CAP_PROP_GAIN, 200)
+            except Exception:
+                pass
+            
+            # Logging actual obtained settings
+            actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            actual_fps = cap.get(cv2.CAP_PROP_FPS)
+            print(f"[FALCON] Camera {index} active: {actual_w}x{actual_h} @ {actual_fps}FPS")
+            
+        self._webcam = WebcamStream(cap=cap)
         return self._webcam.is_opened()
 
     def close_camera(self):
@@ -508,15 +582,28 @@ class VisionPipeline:
         det_keypoints = None
 
         if result.boxes is not None and len(result.boxes) > 0:
-            xyxy = result.boxes.xyxy.cpu().numpy()
-            confs = result.boxes.conf.cpu().numpy()
-            mask = confs >= CONFIDENCE_THRESHOLD
-            det_boxes = xyxy[mask]
-            det_confs = confs[mask]
+            # OPTIMIZATION: Process filtering on GPU to reduce transfer volume
+            boxes = result.boxes
+            # boxes.conf and boxes.xyxy keep data on device (cuda:0)
+            
+            # Create a boolean mask on GPU
+            mask = boxes.conf >= CONFIDENCE_THRESHOLD
+            
+            # Apply mask on GPU tensors (much faster!)
+            filtered_boxes = boxes.xyxy[mask]
+            filtered_confs = boxes.conf[mask]
 
-            if result.keypoints is not None and len(result.keypoints) > 0:
-                kp_data = result.keypoints.data.cpu().numpy()
-                det_keypoints = kp_data[mask]
+            # Only transfer the filtered results to CPU
+            if len(filtered_boxes) > 0:
+                det_boxes = filtered_boxes.cpu().numpy()
+                det_confs = filtered_confs.cpu().numpy()
+
+                if result.keypoints is not None:
+                    # Filter keypoints on GPU too
+                    kp_data = result.keypoints.data
+                    if len(kp_data) > 0:
+                        filtered_kps = kp_data[mask]
+                        det_keypoints = filtered_kps.cpu().numpy()
 
         return det_boxes, det_confs, det_keypoints
 
@@ -856,20 +943,24 @@ class FalconGUI:
         frame = self.pipeline.get_frame()
         if frame is not None:
             # Convert BGR → RGB → PIL → PhotoImage
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(rgb)
-
-            # Scale to fit the label while keeping aspect ratio
+            # Resize *before* heavier conversions (OpenCV resize is faster than PIL resize)
             lw = self.video_label.winfo_width()
             lh = self.video_label.winfo_height()
-            if lw > 1 and lh > 1:
-                img_w, img_h = pil_img.size
-                scale = min(lw / img_w, lh / img_h)
-                new_w = max(int(img_w * scale), 1)
-                new_h = max(int(img_h * scale), 1)
-                pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
 
-            self._photo = ImageTk.PhotoImage(pil_img)
+            if lw > 1 and lh > 1:
+                h, w = frame.shape[:2]  # frame is numpy array
+                scale = min(lw / w, lh / h)
+                new_w = max(int(w * scale), 1)
+                new_h = max(int(h * scale), 1)
+                
+                # Use INTER_LINEAR or NEAREST for speed (LANCZOS/CUBIC is too slow)
+                if new_w != w or new_h != h:
+                    frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb)
+            
+            self._photo = ImageTk.PhotoImage(image=pil_img)
             self.video_label.configure(image=self._photo, text="")
 
             # Update FPS readout
