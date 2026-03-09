@@ -199,6 +199,7 @@ class TrackingManager:
         self._next_id: int = 1
         self.tracks: List[PersonTracker] = []
         self.occlusion_analyzer = OcclusionAnalyzer()
+        self._depth_poll_counter: int = 0
 
     @property
     def max_tracking_error(self) -> float:
@@ -244,6 +245,9 @@ class TrackingManager:
         if det_confs is None:
             det_confs = np.ones(len(det_boxes))
 
+        self._depth_poll_counter += 1
+        _poll_depth = (self._depth_poll_counter % 3 == 0)
+
         # Pre-compute histograms for each detection
         det_hists: List[Optional[np.ndarray]] = []
         for d_idx in range(len(det_boxes)):
@@ -264,14 +268,14 @@ class TrackingManager:
         for t_idx, d_idx in matched:
             track = self.tracks[t_idx]
             kps = det_keypoints[d_idx] if det_keypoints is not None else None
-            depth = self._query_depth(depth_frame, det_boxes[d_idx])
+            depth = self._query_depth(depth_frame, det_boxes[d_idx]) if _poll_depth else track.z_depth_meters
             self._update_track(track, det_boxes[d_idx], kps, det_confs[d_idx],
                                det_hists[d_idx], depth)
 
         # 4. Create new tracks for unmatched detections
         for d_idx in unmatched_dets:
             kps = det_keypoints[d_idx] if det_keypoints is not None else None
-            depth = self._query_depth(depth_frame, det_boxes[d_idx])
+            depth = self._query_depth(depth_frame, det_boxes[d_idx]) if _poll_depth else None
             self._create_track(det_boxes[d_idx], kps, det_confs[d_idx],
                                det_hists[d_idx], depth)
 
@@ -308,7 +312,7 @@ class TrackingManager:
         # 6. Classify occlusion for every track + recovery bookkeeping
         for track in self.tracks:
             # Query live depth at the track's current (possibly predicted) bbox
-            current_depth = self._query_depth(depth_frame, track.bbox)
+            current_depth = self._query_depth(depth_frame, track.bbox) if _poll_depth else track.z_depth_meters
 
             raw_state = self.occlusion_analyzer.analyze(
                 keypoints=track.keypoints if not track.is_predicted else None,
