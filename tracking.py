@@ -116,6 +116,9 @@ class PersonTracker:
     # Kalman innovation (prediction-vs-measurement error)
     tracking_error: float = 0.0
 
+    # Real depth from RealSense (metres), None when unavailable
+    z_depth_meters: Optional[float] = None
+
     # ── helpers ──────────────────────────────────────────────────────
 
     def push_history(self) -> None:
@@ -225,6 +228,7 @@ class TrackingManager:
         det_keypoints: Optional[np.ndarray] = None,
         det_confs: Optional[np.ndarray] = None,
         frame: Optional[np.ndarray] = None,
+        depth_frame: Optional[np.ndarray] = None,
     ) -> List[PersonTracker]:
         """
         Process one frame of detections and return all active tracks.
@@ -239,6 +243,9 @@ class TrackingManager:
             Detection-level confidence scores.
         frame : ndarray | None
             Raw BGR frame used to compute appearance histograms.
+        depth_frame : ndarray | None
+            RealSense depth frame (uint16, millimetres).  ``None`` when
+            running with a standard webcam.
 
         Returns
         -------
@@ -270,14 +277,16 @@ class TrackingManager:
         for t_idx, d_idx in matched:
             track = self.tracks[t_idx]
             kps = det_keypoints[d_idx] if det_keypoints is not None else None
+            depth = self._query_depth(depth_frame, det_boxes[d_idx])
             self._update_track(track, det_boxes[d_idx], kps, det_confs[d_idx],
-                               det_hists[d_idx])
+                               det_hists[d_idx], depth)
 
         # 4. Create new tracks for unmatched detections
         for d_idx in unmatched_dets:
             kps = det_keypoints[d_idx] if det_keypoints is not None else None
+            depth = self._query_depth(depth_frame, det_boxes[d_idx])
             self._create_track(det_boxes[d_idx], kps, det_confs[d_idx],
-                               det_hists[d_idx])
+                               det_hists[d_idx], depth)
 
         # 5. Handle unmatched (lost) tracks – rely on prediction
         for t_idx in unmatched_tracks:
@@ -401,6 +410,24 @@ class TrackingManager:
         unmatched_tracks = [t for t in range(n_tracks) if t not in used_tracks]
         return matched, unmatched_dets, unmatched_tracks
 
+    @staticmethod
+    def _query_depth(
+        depth_frame: Optional[np.ndarray],
+        bbox: np.ndarray,
+    ) -> Optional[float]:
+        """Return depth in metres at the centre of *bbox*, or None."""
+        if depth_frame is None:
+            return None
+        cx = int((bbox[0] + bbox[2]) / 2)
+        cy = int((bbox[1] + bbox[3]) / 2)
+        h, w = depth_frame.shape[:2]
+        cx = max(0, min(cx, w - 1))
+        cy = max(0, min(cy, h - 1))
+        raw = int(depth_frame[cy, cx])
+        if raw == 0:
+            return None
+        return raw / 1000.0
+
     def _update_track(
         self,
         track: PersonTracker,
@@ -408,6 +435,7 @@ class TrackingManager:
         keypoints: Optional[np.ndarray],
         conf: float,
         histogram: Optional[np.ndarray] = None,
+        depth: Optional[float] = None,
     ) -> None:
         """Update an existing track with a matched detection."""
         # ── Recovery detection ───────────────────────────────────────
@@ -435,6 +463,9 @@ class TrackingManager:
         # Update relative skeleton offsets
         track.update_relative_skeleton()
 
+        # Store depth reading
+        track.z_depth_meters = depth
+
         # Kalman update with full measurement [cx, cy, s, r]
         w, h = track.bbox_wh
         s = float(w * h)           # area (scale)
@@ -461,6 +492,7 @@ class TrackingManager:
         keypoints: Optional[np.ndarray],
         conf: float,
         histogram: Optional[np.ndarray] = None,
+        depth: Optional[float] = None,
     ) -> PersonTracker:
         """Spawn a new track from an unmatched detection."""
         track = PersonTracker(
@@ -469,6 +501,7 @@ class TrackingManager:
             keypoints=keypoints.copy() if keypoints is not None else None,
             detection_conf=conf,
             histogram=histogram,
+            z_depth_meters=depth,
         )
         track.last_bbox_size = track.bbox_wh.copy()
         self._next_id += 1

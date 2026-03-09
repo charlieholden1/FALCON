@@ -14,8 +14,6 @@ in a lightweight Tkinter GUI with:
 
 from __future__ import annotations
 
-import queue
-import sys
 import threading
 import time
 import tkinter as tk
@@ -28,6 +26,7 @@ from PIL import Image, ImageTk
 
 from occlusion import OcclusionState
 from tracking import TrackingManager
+from camera_stream import DualStreamCamera
 
 # ── Model catalogue ─────────────────────────────────────────────────
 
@@ -210,55 +209,6 @@ def _draw_ghost_skeleton(img, keypoints, conf_thresh=0.3, dash_len=8):
             cv2.circle(img, (int(kx), int(ky)), 3, ghost_colour, 1, cv2.LINE_AA)
 
 
-# ── Asynchronous Webcam Capture ──────────────────────────────────────
-
-class WebcamStream:
-    """Threaded webcam reader that decouples capture from processing."""
-
-    def __init__(self, cap: cv2.VideoCapture, q_size: int = 2):
-        self.cap = cap
-        self._q: queue.Queue = queue.Queue(maxsize=q_size)
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-
-    def is_opened(self) -> bool:
-        return self.cap.isOpened()
-
-    def start(self) -> "WebcamStream":
-        self._running = True
-        self._thread = threading.Thread(target=self._reader, daemon=True)
-        self._thread.start()
-        return self
-
-    def _reader(self) -> None:
-        while self._running:
-            ret, frame = self.cap.read()
-            if not ret:
-                continue
-            # Drop oldest frame if the consumer is too slow
-            if self._q.full():
-                try:
-                    self._q.get_nowait()
-                except queue.Empty:
-                    pass
-            self._q.put(frame)
-
-    def read(self) -> Optional[np.ndarray]:
-        """Return the latest frame or None if none available."""
-        try:
-            return self._q.get(timeout=0.02)
-        except queue.Empty:
-            return None
-
-    def stop(self) -> None:
-        self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-        if self.cap is not None:
-            self.cap.release()
-
-
 # ── Vision Pipeline (runs in background thread) ─────────────────────
 
 class VisionPipeline:
@@ -274,7 +224,7 @@ class VisionPipeline:
     BURST_LENGTH: int = 8        # consecutive full-detect frames after spike
 
     def __init__(self, skip_frames: int = 2):
-        self._webcam: Optional[WebcamStream] = None
+        self._webcam: Optional[DualStreamCamera] = None
         self.model = None
         self.mp_pose = None              # MediaPipe Pose instance
         self.backend: str = "yolo"       # "yolo" or "mediapipe"
@@ -398,54 +348,10 @@ class VisionPipeline:
 
     def open_camera(self, index: int = 0) -> bool:
         """
-        Opens camera with optimized OS-aware settings, then passes the 
-        configured object to the WebcamStream thread.
+        Open a DualStreamCamera (RealSense with webcam fallback).
         """
         print(f"[FALCON] Attempting to open camera {index}...")
-
-        if sys.platform == "linux":
-            # Linux / Jetson Optimizations
-            # Try V4L2 with FORCE MJPG first (fixes 8-15 FPS USB issues)
-            cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(index)
-        elif sys.platform == "win32":
-            # Windows Optimizations (DSHOW is safer and faster on windows)
-            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(index)
-        else:
-            cap = cv2.VideoCapture(index)
-
-        if cap.isOpened():
-            # Force MJPG - Critical for USB 2.0/3.0 bandwidth
-            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-            cap.set(cv2.CAP_PROP_FOURCC, fourcc)
-            
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            cap.set(cv2.CAP_PROP_FPS, 30)
-
-            # Logitech C270 / General manual exposure settings for 30FPS
-            try:
-                # Disable auto exposure
-                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) 
-                
-                # Set manual exposure value (100-200 is typical for 30fps indoor)
-                cap.set(cv2.CAP_PROP_EXPOSURE, 320)
-                
-                # Boost Gain heavily to compensate for lower exposure time
-                cap.set(cv2.CAP_PROP_GAIN, 200)
-            except Exception:
-                pass
-            
-            # Logging actual obtained settings
-            actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-            actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-            actual_fps = cap.get(cv2.CAP_PROP_FPS)
-            print(f"[FALCON] Camera {index} active: {actual_w}x{actual_h} @ {actual_fps}FPS")
-            
-        self._webcam = WebcamStream(cap=cap)
+        self._webcam = DualStreamCamera(webcam_index=index)
         return self._webcam.is_opened()
 
     def close_camera(self):
@@ -503,7 +409,7 @@ class VisionPipeline:
                 time.sleep(0.01)
                 continue
 
-            frame = self._webcam.read()
+            frame, depth_frame = self._webcam.read()
             if frame is None:
                 continue
 
@@ -522,7 +428,8 @@ class VisionPipeline:
                     frame, w_frame, h_frame,
                 )
                 tracks = self.tracker.update(
-                    det_boxes, det_keypoints, det_confs, frame=frame,
+                    det_boxes, det_keypoints, det_confs,
+                    frame=frame, depth_frame=depth_frame,
                 )
 
                 # ── adaptive skip-rate adjustment ────────────────────
@@ -629,6 +536,7 @@ class VisionPipeline:
         n_occluded = 0
         n_predicted = 0
         n_recovered = 0
+        n_depth = 0
         h_frame, w_frame = vis.shape[:2]
 
         for t in tracks:
@@ -666,6 +574,9 @@ class VisionPipeline:
 
             # Occlusion state label
             occ_label = t.occlusion_state.label
+            if t.z_depth_meters is not None:
+                occ_label += f"  [{t.z_depth_meters:.2f}m]"
+                n_depth += 1
             cv2.putText(vis, label, (x1, y1 - 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 2, cv2.LINE_AA)
             cv2.putText(vis, occ_label, (x1, y1 - 5),
@@ -685,6 +596,7 @@ class VisionPipeline:
             f"Occluded: {n_occluded}",
             f"Predicted: {n_predicted}",
             f"Recovered: {n_recovered}",
+            f"Depth: {n_depth}/{len(tracks)}",
         ]
         for i, line in enumerate(overlay_lines):
             cv2.putText(vis, line, (10, 25 + i * 25),
