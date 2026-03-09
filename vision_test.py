@@ -17,7 +17,6 @@ import numpy as np
 from ultralytics import YOLO
 
 from occlusion import OcclusionState
-from radar import CameraProjection, MockRadar
 from tracking import TrackingManager
 
 # ── Configuration ───────────────────────────────────────────────────
@@ -104,10 +103,6 @@ def main():
         recovery_duration=90,
     )
 
-    # ── Mock Radar & Camera Projection ──────────────────────────────
-    mock_radar = MockRadar()
-    cam_proj   = CameraProjection()
-
     # ── Open webcam ─────────────────────────────────────────────────
     print("[FALCON] Initialising webcam …")
     cap = cv2.VideoCapture(WEBCAM_INDEX)
@@ -152,7 +147,7 @@ def main():
                 det_keypoints = kp_data[mask]
 
         # ── Update tracker ──────────────────────────────────────────
-        tracks = tracker.update(det_boxes, det_keypoints, det_confs)
+        tracks = tracker.update(det_boxes, det_keypoints, det_confs, frame=frame)
 
         # ── Start with the raw frame (we draw our own annotations) ──
         vis = frame.copy()
@@ -161,7 +156,6 @@ def main():
         n_occluded = 0
         n_predicted = 0
         n_recovered = 0
-        radar_active = False
 
         for t in tracks:
             colour = t.occlusion_state.colour_bgr
@@ -210,43 +204,12 @@ def main():
             cv2.putText(vis, occ_label, (x1, y1 - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour, 1, cv2.LINE_AA)
 
-            # ── Radar crosshair for heavily occluded / lost ──────
-            if t.occlusion_state in (
-                OcclusionState.HEAVILY_OCCLUDED,
-                OcclusionState.LOST,
-            ):
-                pt3d = mock_radar.get_target_3d()
-                u, v = cam_proj.project_3d_to_2d(pt3d)
-                h_frame, w_frame = vis.shape[:2]
-                if 0 <= u < w_frame and 0 <= v < h_frame:
-                    radar_colour = (255, 0, 255)  # magenta
-                    cross_size = 20
-                    # Crosshair lines
-                    cv2.line(vis, (u - cross_size, v), (u + cross_size, v),
-                             radar_colour, 2, cv2.LINE_AA)
-                    cv2.line(vis, (u, v - cross_size), (u, v + cross_size),
-                             radar_colour, 2, cv2.LINE_AA)
-                    # Outer circle
-                    cv2.circle(vis, (u, v), cross_size, radar_colour, 2, cv2.LINE_AA)
-                    # Radar-target bounding box (80×160 px placeholder)
-                    rw, rh = 40, 80
-                    cv2.rectangle(vis, (u - rw, v - rh), (u + rw, v + rh),
-                                  radar_colour, 2)
-                    # Label
-                    cv2.putText(
-                        vis, f"RADAR TARGET #{t.track_id}",
-                        (u - rw, v - rh - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                        radar_colour, 2, cv2.LINE_AA,
-                    )
-
             if t.occlusion_state in (
                 OcclusionState.PARTIALLY_OCCLUDED,
                 OcclusionState.HEAVILY_OCCLUDED,
                 OcclusionState.LOST,
             ):
                 n_occluded += 1
-                radar_active = True
 
         # ── FPS calculation ─────────────────────────────────────────
         frame_count += 1
@@ -270,24 +233,8 @@ def main():
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA,
             )
 
-        # ── RADAR ACTIVE banner ─────────────────────────────────────
-        if radar_active:
-            banner = "RADAR ACTIVE"
-            banner_colour = (0, 0, 255)   # red
-            (tw, th), _ = cv2.getTextSize(
-                banner, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2,
-            )
-            bx = vis.shape[1] - tw - 20
-            by = 40
-            # Semi-transparent background
-            overlay = vis.copy()
-            cv2.rectangle(overlay, (bx - 10, by - th - 10),
-                          (bx + tw + 10, by + 10), banner_colour, -1)
-            cv2.addWeighted(overlay, 0.5, vis, 0.5, 0, vis)
-            cv2.putText(vis, banner, (bx, by),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-                        (255, 255, 255), 2, cv2.LINE_AA)
-        else:
+        # ── Status banner ─────────────────────────────────────────
+        if n_occluded == 0:
             cv2.putText(vis, "STATE: ALL VISIBLE", (10, vis.shape[0] - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                         (0, 255, 0), 2, cv2.LINE_AA)
