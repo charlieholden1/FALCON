@@ -25,6 +25,7 @@ import numpy as np
 
 from occlusion import OcclusionAnalyzer, OcclusionState
 from prediction import KalmanPredictor
+from radar import CameraProjection, RadarPoint
 
 
 # ── Utility ─────────────────────────────────────────────────────────
@@ -106,6 +107,14 @@ class PersonTracker:
     # Real depth from RealSense (metres), None when unavailable
     z_depth_meters: Optional[float] = None
 
+    # Radar fusion state
+    radar_position_3d: Optional[np.ndarray] = None   # [X, Y, Z] metres in radar frame
+    radar_velocity: Optional[float] = None            # radial velocity m/s
+    radar_confidence: float = 0.0                     # 0-1, decays when no radar match
+    using_radar: bool = False                         # True when position driven by radar
+    radar_frames_matched: int = 0                     # consecutive frames with radar match
+    last_radar_match_frame: int = 0                   # frame counter at last radar match
+
     # ── helpers ──────────────────────────────────────────────────────
 
     def push_history(self) -> None:
@@ -157,6 +166,20 @@ class PersonTracker:
         ghost[:, 1] += pred_center[1]
         return ghost
 
+    def radar_position_2d(
+        self, projection: CameraProjection,
+    ) -> Optional[Tuple[int, int]]:
+        """Project stored radar_position_3d to pixel coords.
+
+        Returns ``None`` if no radar data is available.
+        """
+        if self.radar_position_3d is None:
+            return None
+        u, v = projection.project_3d_to_2d(self.radar_position_3d)
+        if u == -1 and v == -1:
+            return None
+        return (u, v)
+
 
 # ── TrackingManager ─────────────────────────────────────────────────
 
@@ -188,6 +211,13 @@ class TrackingManager:
         recovery_duration: int = 20,
         iou_weight: float = 1.0,
         hist_weight: float = 0.0,
+        radar: object = None,
+        projection: Optional[CameraProjection] = None,
+        radar_depth_tolerance: float = 0.8,
+        radar_pixel_tolerance: float = 120.0,
+        radar_handoff_state: OcclusionState = OcclusionState.HEAVILY_OCCLUDED,
+        radar_confidence_decay: float = 0.85,
+        radar_max_frames: int = 150,
     ):
         self.iou_threshold = iou_threshold
         self.max_frames_lost = max_frames_lost
@@ -196,10 +226,21 @@ class TrackingManager:
         self.iou_weight = iou_weight
         self.hist_weight = hist_weight
 
+        # Radar fusion
+        self.radar = radar
+        self.projection = projection
+        self.radar_depth_tolerance = radar_depth_tolerance
+        self.radar_pixel_tolerance = radar_pixel_tolerance
+        self.radar_handoff_state = radar_handoff_state
+        self.radar_confidence_decay = radar_confidence_decay
+        self.radar_max_frames = radar_max_frames
+        self._radar_point_count = 0  # latest frame's point count
+
         self._next_id: int = 1
         self.tracks: List[PersonTracker] = []
         self.occlusion_analyzer = OcclusionAnalyzer()
         self._depth_poll_counter: int = 0
+        self._global_frame_counter: int = 0
 
     @property
     def max_tracking_error(self) -> float:
@@ -245,6 +286,7 @@ class TrackingManager:
         if det_confs is None:
             det_confs = np.ones(len(det_boxes))
 
+        self._global_frame_counter += 1
         self._depth_poll_counter += 1
         _poll_depth = (self._depth_poll_counter % 3 == 0)
 
@@ -341,6 +383,9 @@ class TrackingManager:
                 track.occlusion_state = raw_state
                 if raw_state == OcclusionState.VISIBLE:
                     track.was_occluded = False
+
+        # 6b. Radar fusion – hand off occluded tracks to radar
+        self._fuse_radar()
 
         # 7. Remove stale tracks
         self._remove_stale_tracks()
@@ -535,12 +580,146 @@ class TrackingManager:
         self.tracks.append(track)
         return track
 
+    # ── radar fusion ────────────────────────────────────────────────
+
+    def _fuse_radar(self) -> None:
+        """Match occluded tracks to radar point cloud and hand off position."""
+        if self.radar is None or not self.radar.is_connected():
+            self._radar_point_count = 0
+            return
+
+        radar_points: List[RadarPoint] = self.radar.get_point_cloud()
+        self._radar_point_count = len(radar_points)
+
+        if not radar_points:
+            # Decay all radar-using tracks
+            for track in self.tracks:
+                if track.using_radar:
+                    track.radar_confidence *= self.radar_confidence_decay
+                    if track.radar_confidence < 0.1:
+                        track.using_radar = False
+            return
+
+        # Track which radar points have already been claimed
+        used_radar: set = set()
+
+        # Pass 1: associate occluded/lost tracks with radar points
+        for track in self.tracks:
+            if track.occlusion_state not in (
+                OcclusionState.HEAVILY_OCCLUDED,
+                OcclusionState.LOST,
+            ) and track.occlusion_state != self.radar_handoff_state:
+                continue
+
+            best_idx = -1
+            best_score = float("inf")
+
+            # Estimated 3D position for this track
+            est_depth = track.z_depth_meters
+            pred_center = track.predictor.get_state_position()
+            if pred_center is None:
+                pred_center = track.center
+
+            for r_idx, rp in enumerate(radar_points):
+                if r_idx in used_radar:
+                    continue
+
+                # Depth check
+                if est_depth is not None:
+                    depth_err = abs(rp.y - est_depth)
+                    if depth_err > self.radar_depth_tolerance:
+                        continue
+                else:
+                    depth_err = 0.0
+
+                # 2D pixel proximity check
+                pixel_err = 0.0
+                if self.projection is not None:
+                    u, v = self.projection.project_3d_to_2d(rp.position_3d)
+                    if u != -1 and v != -1:
+                        pixel_err = float(np.linalg.norm(
+                            np.array([u, v]) - pred_center
+                        ))
+                        if pixel_err > self.radar_pixel_tolerance:
+                            continue
+                    else:
+                        continue  # behind camera
+
+                score = depth_err + pixel_err * 0.01
+                if score < best_score:
+                    best_score = score
+                    best_idx = r_idx
+
+            if best_idx >= 0:
+                rp = radar_points[best_idx]
+                used_radar.add(best_idx)
+
+                track.radar_position_3d = rp.position_3d.copy()
+                track.radar_velocity = rp.velocity
+                track.radar_confidence = min(1.0, track.radar_confidence + 0.3)
+                track.using_radar = True
+                track.radar_frames_matched += 1
+                track.last_radar_match_frame = self._global_frame_counter
+
+                # Project radar position to 2D and feed Kalman as measurement
+                if self.projection is not None:
+                    u, v = self.projection.project_3d_to_2d(rp.position_3d)
+                    if u != -1 and v != -1:
+                        track.predictor.update(
+                            np.array([float(u), float(v)])
+                        )
+                        # Update bbox from new Kalman state
+                        pred_bbox = track.predictor.get_state_bbox()
+                        if pred_bbox is not None:
+                            track.bbox = pred_bbox
+                        elif track.last_bbox_size is not None:
+                            w, h = track.last_bbox_size
+                            track.bbox = np.array([
+                                u - w / 2, v - h / 2,
+                                u + w / 2, v + h / 2,
+                            ])
+            else:
+                # No radar match for this occluded track
+                if track.using_radar:
+                    track.radar_confidence *= self.radar_confidence_decay
+                    if track.radar_confidence < 0.1:
+                        track.using_radar = False
+                        track.radar_frames_matched = 0
+
+        # Pass 2: visible/partial tracks that were using radar — release them
+        for track in self.tracks:
+            if track.occlusion_state in (
+                OcclusionState.VISIBLE,
+                OcclusionState.PARTIALLY_OCCLUDED,
+                OcclusionState.RECOVERED,
+            ) and track.using_radar:
+                track.using_radar = False
+                track.radar_confidence *= 0.95
+
+    @property
+    def radar_fused_count(self) -> int:
+        """Number of tracks currently using radar."""
+        return sum(1 for t in self.tracks if t.using_radar)
+
+    @property
+    def radar_point_count(self) -> int:
+        """Number of points in the latest radar frame."""
+        return self._radar_point_count
+
     def _remove_stale_tracks(self) -> None:
-        """Drop tracks that have been missing for too many frames."""
-        self.tracks = [
-            t for t in self.tracks
-            if t.frames_since_detection <= self.max_frames_lost
-        ]
+        """Drop tracks that have been missing for too many frames.
+
+        Radar-tracked targets are kept alive longer (up to
+        ``radar_max_frames``) as long as radar confidence remains.
+        """
+        kept: List[PersonTracker] = []
+        for t in self.tracks:
+            if t.frames_since_detection <= self.max_frames_lost:
+                kept.append(t)
+            elif (t.using_radar and t.radar_confidence > 0.3
+                  and t.frames_since_detection <= self.radar_max_frames):
+                kept.append(t)
+        self.tracks = kept
 
     # ── lightweight predict-only pass (for frame-skipping) ───────────
 

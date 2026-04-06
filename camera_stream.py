@@ -18,6 +18,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+import time
 from typing import Optional, Tuple
 
 import cv2
@@ -132,24 +133,36 @@ class DualStreamCamera:
         """
         cameras: list = []
 
-        # Discover RealSense devices
+        # Always expose a generic RealSense option when the SDK is present.
+        # On Jetson/Linux the SDK device discovery can fail in some contexts
+        # even though opening the pipeline directly still works.
         if _HAS_REALSENSE:
+            cameras.append({
+                "label": "Intel RealSense (Auto)",
+                "type": "realsense",
+                "index": None,
+                "serial": None,
+            })
             try:
                 ctx = rs.context()
                 for dev in ctx.devices:
                     name = dev.get_info(rs.camera_info.name)
                     serial = dev.get_info(rs.camera_info.serial_number)
-                    cameras.append({
+                    entry = {
                         "label": f"{name} (Depth)",
                         "type": "realsense",
                         "index": None,
                         "serial": serial,
-                    })
+                    }
+                    if entry not in cameras:
+                        cameras.append(entry)
             except Exception:
                 pass
 
-        # Offer webcam indices 0-9
-        for i in range(10):
+        # Avoid probing webcam indices during GUI startup because some
+        # V4L2 stacks emit noisy driver errors or leave invalid handles
+        # behind. Keep a few manual entries available as fallback.
+        for i in range(4):
             cameras.append({
                 "label": f"Webcam {i}",
                 "type": "webcam",
@@ -158,6 +171,31 @@ class DualStreamCamera:
             })
 
         return cameras
+
+    @staticmethod
+    def _open_webcam_capture(index: int) -> cv2.VideoCapture:
+        if sys.platform == "linux":
+            cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(index)
+        elif sys.platform == "win32":
+            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(index)
+        else:
+            cap = cv2.VideoCapture(index)
+        return cap
+
+    @staticmethod
+    def _probe_webcam_index(index: int) -> bool:
+        cap = DualStreamCamera._open_webcam_capture(index)
+        try:
+            if not cap.isOpened():
+                return False
+            ok, frame = cap.read()
+            return bool(ok and frame is not None and frame.size > 0)
+        finally:
+            cap.release()
 
     # ── RealSense initialisation ────────────────────────────────────
 
@@ -217,6 +255,9 @@ class DualStreamCamera:
                 break
 
         # Post-processing filters for cleaner depth maps
+        # These filters improve depth cosmetics, but they cost noticeable
+        # CPU on Jetson. Keep them available but off by default.
+        self._rs_enable_depth_postprocess = False
         self._rs_spatial = rs.spatial_filter()
         self._rs_spatial.set_option(rs.option.filter_magnitude, 2)
         self._rs_spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
@@ -240,16 +281,7 @@ class DualStreamCamera:
     # ── Webcam fallback ─────────────────────────────────────────────
 
     def _init_webcam(self, index: int, w: int, h: int, fps: int) -> None:
-        if sys.platform == "linux":
-            cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(index)
-        elif sys.platform == "win32":
-            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(index)
-        else:
-            cap = cv2.VideoCapture(index)
+        cap = self._open_webcam_capture(index)
 
         if cap.isOpened():
             fourcc = cv2.VideoWriter_fourcc(*'MJPG')
@@ -266,16 +298,27 @@ class DualStreamCamera:
             actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
             actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
             actual_fps = cap.get(cv2.CAP_PROP_FPS)
-            print(f"[FALCON] Webcam fallback active: {actual_w}x{actual_h} @ {actual_fps}FPS")
+            ok, frame = cap.read()
+            if not ok or frame is None or frame.size == 0:
+                print(f"[FALCON] Webcam {index} opened but did not return frames")
+                cap.release()
+                cap = None
+            else:
+                print(
+                    f"[FALCON] Webcam fallback active: "
+                    f"{actual_w}x{actual_h} @ {actual_fps}FPS"
+                )
 
         self._cap = cap
         self._q = queue.Queue(maxsize=self._q_size)
-        self._opened = cap.isOpened()
+        self._opened = bool(cap is not None and cap.isOpened())
 
     # ── start / stop ────────────────────────────────────────────────
 
     def start(self) -> "DualStreamCamera":
         """Start capturing.  Launches a reader thread for both RS and webcam."""
+        if not self._opened:
+            return self
         self._running = True
         if self._using_realsense:
             self._q = queue.Queue(maxsize=self._q_size)
@@ -305,7 +348,7 @@ class DualStreamCamera:
             if not color_frame:
                 continue
 
-            if depth_frame:
+            if depth_frame and self._rs_enable_depth_postprocess:
                 depth_frame = self._rs_spatial.process(depth_frame)
                 depth_frame = self._rs_temporal.process(depth_frame)
                 depth_frame = self._rs_hole_fill.process(depth_frame)
@@ -322,8 +365,11 @@ class DualStreamCamera:
 
     def _webcam_reader(self) -> None:
         while self._running:
+            if self._cap is None or not self._cap.isOpened():
+                break
             ret, frame = self._cap.read()
             if not ret:
+                time.sleep(0.01)
                 continue
             if self._q.full():
                 try:

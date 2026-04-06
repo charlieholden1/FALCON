@@ -1,0 +1,36 @@
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+falcon_env/
+
+# Local tooling and IDE noise
+.codex
+.codex/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Generated diagnostics and captures
+diagnostics_runs/
+04_01_2026_16_12_52/
+
+# Large local model and build artifacts
+*.engine
+*.onnx
+*.whl
+
+# Vendored / extracted local deps not needed for pushing app code
+torchvision/

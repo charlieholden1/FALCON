@@ -14,9 +14,12 @@ in a lightweight Tkinter GUI with:
 
 from __future__ import annotations
 
+import glob
+import logging
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk
 from typing import Optional
 
@@ -27,6 +30,9 @@ from PIL import Image, ImageTk
 from occlusion import OcclusionState
 from tracking import TrackingManager
 from camera_stream import DualStreamCamera
+from radar import CameraProjection, IWR6843Driver, MockRadar
+
+logger = logging.getLogger("falcon.gui")
 
 # Discover available cameras once at import time
 _CAMERA_LIST = DualStreamCamera.discover_cameras()
@@ -93,23 +99,8 @@ _MP_TO_COCO = {
 CONFIDENCE_THRESHOLD = 0.45
 TRAIL_LENGTH = 10
 
-# ── Hardware-accelerated resize helper ───────────────────────────────
-
-try:
-    _cuda_resize = cv2.cuda.resize  # type: ignore[attr-defined]
-    _HAS_CUDA_RESIZE = True
-except AttributeError:
-    _HAS_CUDA_RESIZE = False
-
-
 def _gpu_resize(frame: np.ndarray, new_w: int, new_h: int) -> np.ndarray:
-    """Resize using cv2.cuda when available, else CPU INTER_NEAREST."""
-    if _HAS_CUDA_RESIZE:
-        gpu_mat = cv2.cuda.GpuMat()
-        gpu_mat.upload(frame)
-        gpu_out = cv2.cuda.resize(gpu_mat, (new_w, new_h),
-                                  interpolation=cv2.INTER_NEAREST)
-        return gpu_out.download()
+    """Resize for display on CPU to avoid contending with YOLO on CUDA."""
     return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
 
 
@@ -232,6 +223,25 @@ class VisionPipeline:
         self.model = None
         self.mp_pose = None              # MediaPipe Pose instance
         self.backend: str = "yolo"       # "yolo" or "mediapipe"
+        self._yolo_half = False
+        self._yolo_device = "cpu"
+        self._yolo_imgsz = 320
+        self._yolo_is_engine = False
+        self._timing = {
+            "cam_ms": 0.0,
+            "detect_ms": 0.0,
+            "track_ms": 0.0,
+            "draw_ms": 0.0,
+        }
+
+        # Radar & projection 
+        self._radar = None               # IWR6843Driver or MockRadar
+        self._radar_backup = None        # stored ref when toggled off
+        self._radar_init_thread: Optional[threading.Thread] = None
+        self._radar_status_message = "Radar: idle"
+        self.projection: Optional[CameraProjection] = None
+        self.radar_enabled = True
+        self.show_radar_overlay = True
 
         self.tracker = TrackingManager(
             iou_threshold=0.3,
@@ -262,6 +272,11 @@ class VisionPipeline:
         self._fps_timer = time.time()
         self._frame_count = 0
 
+    def ensure_projection(self) -> CameraProjection:
+        if self.projection is None:
+            self.projection = CameraProjection()
+        return self.projection
+
     # ── model loading ────────────────────────────────────────────────
 
     def load_model(self, model_key: str) -> str:
@@ -280,8 +295,13 @@ class VisionPipeline:
                 device = 'cuda' if torch.cuda.is_available() else 'cpu'
                 is_engine = cfg["path"].endswith(".engine")
                 print(f"[FALCON] Loading YOLO model on {device.upper()}...")
+                if device == "cuda":
+                    torch.backends.cudnn.benchmark = True
 
                 self.model = YOLO(cfg["path"], task="pose")
+                self._yolo_device = device
+                self._yolo_imgsz = 320 if device == "cuda" else 416
+                self._yolo_is_engine = is_engine
 
                 if is_engine:
                     # TensorRT engine – run FP16 inference; device is baked in
@@ -385,15 +405,183 @@ class VisionPipeline:
 
     # ── start / stop ─────────────────────────────────────────────────
 
+    def _init_radar(self) -> None:
+        """Initialize the projection immediately and radar asynchronously."""
+        self._init_projection_from_camera()
+        self._radar_status_message = "Radar: scanning..."
+        self._radar_init_thread = threading.Thread(
+            target=self._init_radar_worker,
+            daemon=True,
+            name="radar-init",
+        )
+        self._radar_init_thread.start()
+
+    def _init_projection_from_camera(self) -> None:
+        """Build the camera projection from the current camera intrinsics."""
+        K = None
+        if (self._webcam is not None
+                and hasattr(self._webcam, '_rs_pipeline')
+                and self._webcam._rs_pipeline is not None):
+            try:
+                import pyrealsense2 as rs
+                profile = self._webcam._rs_pipeline.get_active_profile()
+                intr = (profile.get_stream(rs.stream.color)
+                        .as_video_stream_profile().get_intrinsics())
+                K = np.array([
+                    [intr.fx, 0.0, intr.ppx],
+                    [0.0, intr.fy, intr.ppy],
+                    [0.0, 0.0, 1.0],
+                ], dtype=np.float64)
+                logger.info("Using RealSense intrinsics for projection")
+            except Exception:
+                pass
+        self.projection = CameraProjection(K=K)
+        calib_path = Path(CameraProjection.DEFAULT_PATH)
+        if calib_path.exists():
+            try:
+                self.projection.load(calib_path)
+                logger.info("Loaded radar calibration from %s", calib_path)
+            except Exception as exc:
+                logger.warning("Failed to load radar calibration: %s", exc)
+
+    def _discover_radar_ports(self) -> list:
+        """Return likely TI radar UART ports, best-effort."""
+        try:
+            from serial.tools import list_ports
+        except Exception:
+            return []
+
+        ports = list(list_ports.comports())
+        if not ports:
+            return []
+
+        # Prefer stable XDS110 interface numbering when available:
+        # if00 -> command UART, if03 -> logging/data UART.
+        command_port = None
+        data_port = None
+        for port in ports:
+            hwid = str(getattr(port, "hwid", "") or "").lower()
+            if "0451:bef3" not in hwid and "xds110" not in hwid:
+                continue
+            if "if00" in hwid:
+                command_port = port.device
+            elif "if03" in hwid:
+                data_port = port.device
+        if command_port and data_port:
+            return [command_port, data_port]
+
+        scored = []
+        for port in ports:
+            text = " ".join(
+                str(value or "")
+                for value in (
+                    port.device,
+                    port.description,
+                    port.manufacturer,
+                    port.product,
+                    port.interface,
+                    port.hwid,
+                )
+            ).lower()
+            score = 0
+            if "texas instruments" in text or "ti " in text:
+                score += 4
+            if "xds110" in text:
+                score += 5
+            if "aux data port" in text or "application/user uart" in text:
+                score += 4
+            if "enhanced com port" in text or "xds110 class auxiliary data port" in text:
+                score += 4
+            if "acm" in port.device.lower() or "usb" in port.device.lower():
+                score += 1
+            if score > 0:
+                scored.append((score, port.device))
+
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        chosen = [device for _, device in scored[:2]]
+        if len(chosen) >= 2:
+            return chosen
+
+        devices = sorted(p.device for p in ports if p.device)
+        if len(devices) == 2:
+            return devices
+        return []
+
+    def _init_radar_worker(self) -> None:
+        ports = self._discover_radar_ports()
+        if len(ports) < 2:
+            self._radar = None
+            self._radar_backup = None
+            self._radar_status_message = "Radar: not found"
+            logger.info("No TI radar serial pair detected")
+            return
+
+        # If discovery returned a stable XDS110 mapping, trust it first and
+        # avoid the noisy reversed-order retry unless the first attempt fails
+        # after opening successfully but never produces frames.
+        attempted_pairs = [(ports[0], ports[1])]
+        if not (ports[0].endswith("ttyACM0") and ports[1].endswith("ttyACM1")):
+            attempted_pairs.append((ports[1], ports[0]))
+
+        for config_port, data_port in attempted_pairs:
+            logger.info("Trying radar ports config=%s data=%s", config_port, data_port)
+            self._radar_status_message = f"Radar: opening {config_port} {data_port}"
+            driver = IWR6843Driver(config_port=config_port, data_port=data_port)
+            if not driver.open():
+                logger.warning("Radar open failed for config=%s data=%s", config_port, data_port)
+                continue
+
+            if driver.wait_for_frame(timeout_s=6.0):
+                logger.info("IWR6843 radar connected on config=%s data=%s", config_port, data_port)
+                self._radar = driver
+                self._radar_backup = driver
+                self._radar_status_message = f"Radar: connected {config_port} {data_port}"
+                if self.tracker is not None and self.radar_enabled:
+                    self.tracker.radar = driver
+                    self.tracker.projection = self.projection
+                return
+
+            logger.warning(
+                "Radar produced no frames on config=%s data=%s; trying next ordering",
+                config_port,
+                data_port,
+            )
+            diag = driver.diagnostics
+            self._radar_status_message = (
+                f"Radar: no frames cfg={config_port} data={data_port} "
+                f"cmd={diag.get('last_command_error', '')} "
+                f"rx={diag.get('rx_bytes', 0)} magic={diag.get('magic_hits', 0)}"
+            ).strip()
+            driver.close()
+
+        self._radar = None
+        self._radar_backup = None
+        if not self._radar_status_message.startswith("Radar: no frames"):
+            self._radar_status_message = "Radar: no frames"
+
+    def toggle_radar(self, enabled: bool) -> None:
+        """Enable or disable radar fusion at runtime."""
+        self.radar_enabled = enabled
+        if enabled and self._radar_backup is not None:
+            self.tracker.radar = self._radar_backup
+        else:
+            self.tracker.radar = None
+
     def start(self):
         if self._running:
             return
         self._running = True
+
+        # Init radar after camera is open
+        self._init_radar()
+
         self.tracker = TrackingManager(
             iou_threshold=0.3,
             max_frames_lost=90,
             prediction_decay=0.90,
             recovery_duration=90,
+            radar=None,
+            projection=self.projection,
         )
         self._skip_counter = 0
         self._burst_remaining = 0
@@ -409,6 +597,12 @@ class VisionPipeline:
         if self._thread is not None:
             self._thread.join(timeout=3.0)
             self._thread = None
+        # Close radar
+        if self._radar is not None:
+            self._radar.close()
+            self._radar = None
+            self._radar_backup = None
+        self._radar_status_message = "Radar: idle"
         self.close_camera()
         with self._lock:
             self._latest_frame = None
@@ -425,10 +619,64 @@ class VisionPipeline:
     def fps(self) -> float:
         return self._fps_value
 
+    def apply_projection_params(self, **params: float) -> None:
+        projection = self.ensure_projection()
+        projection.update(**params)
+
+    def reset_projection(self) -> None:
+        self.ensure_projection().reset()
+
+    def save_projection(self, path: Optional[str] = None) -> Path:
+        projection = self.ensure_projection()
+        return projection.save(path)
+
+    def load_projection(self, path: Optional[str] = None) -> Path:
+        projection = self.ensure_projection()
+        return projection.load(path)
+
+    def projection_params(self) -> dict:
+        return self.ensure_projection().params
+
+    def radar_points(self):
+        radar = self._radar_backup if self._radar_backup is not None else self._radar
+        if radar is None or not radar.is_connected():
+            return []
+        return radar.get_point_cloud()
+
+    def radar_status_text(self) -> str:
+        radar = self._radar_backup if self._radar_backup is not None else self._radar
+        if radar is None:
+            return self._radar_status_message
+
+        points = self.radar_points()
+        diagnostics = getattr(radar, "diagnostics", {})
+        if isinstance(radar, MockRadar):
+            return f"Radar: mock ({len(points)} pts)"
+
+        frames = diagnostics.get("frames", 0)
+        fps = diagnostics.get("fps", 0.0)
+        last_error = diagnostics.get("last_parse_error", "")
+        packet_size = diagnostics.get("last_packet_size", 0)
+        rx_bytes = diagnostics.get("rx_bytes", 0)
+        magic_hits = diagnostics.get("magic_hits", 0)
+        last_cmd_error = diagnostics.get("last_command_error", "")
+        if last_cmd_error:
+            return f"Radar cmd error: {last_cmd_error}"
+        if last_error:
+            return (
+                f"Radar: {len(points)} pts  frames {frames}  "
+                f"rx {rx_bytes}  magic {magic_hits}  pkt {packet_size}  parse {last_error}"
+            )
+        return (
+            f"Radar: {len(points)} pts  frames {frames}  "
+            f"rx {rx_bytes}  magic {magic_hits}  pkt {packet_size}  fps {fps:.1f}"
+        )
+
     # ── main vision loop (background thread) ─────────────────────────
 
     def _loop(self):
         while self._running:
+            loop_t0 = time.time()
             if self._webcam is None:
                 time.sleep(0.01)
                 continue
@@ -436,6 +684,7 @@ class VisionPipeline:
             frame, depth_frame = self._webcam.read()
             if frame is None:
                 continue
+            cam_t1 = time.time()
 
             h_frame, w_frame = frame.shape[:2]
             self._skip_counter += 1
@@ -448,13 +697,16 @@ class VisionPipeline:
 
             if run_detect:
                 # ── full detection frame ─────────────────────────────
+                det_t0 = time.time()
                 det_boxes, det_confs, det_keypoints = self._detect(
                     frame, w_frame, h_frame,
                 )
+                det_t1 = time.time()
                 tracks = self.tracker.update(
                     det_boxes, det_keypoints, det_confs,
                     frame=frame, depth_frame=depth_frame,
                 )
+                track_t1 = time.time()
 
                 # ── adaptive skip-rate adjustment ────────────────────
                 err = self.tracker.max_tracking_error
@@ -471,11 +723,15 @@ class VisionPipeline:
                     self._burst_remaining -= 1
             else:
                 # ── skipped frame: Kalman propagate only ─────────────
+                det_t0 = det_t1 = time.time()
                 tracks = self.tracker.propagate_only()
+                track_t1 = time.time()
 
             # ── annotate ─────────────────────────────────────────────
+            draw_t0 = time.time()
             vis = frame.copy()
             self._annotate(vis, tracks)
+            draw_t1 = time.time()
 
             # ── FPS ──────────────────────────────────────────────────
             self._frame_count += 1
@@ -484,6 +740,11 @@ class VisionPipeline:
                 self._fps_value = self._frame_count / elapsed
                 self._frame_count = 0
                 self._fps_timer = time.time()
+
+            self._timing["cam_ms"] = (cam_t1 - loop_t0) * 1000.0
+            self._timing["detect_ms"] = (det_t1 - det_t0) * 1000.0
+            self._timing["track_ms"] = (track_t1 - det_t1) * 1000.0
+            self._timing["draw_ms"] = (draw_t1 - draw_t0) * 1000.0
 
             with self._lock:
                 self._latest_frame = vis
@@ -498,7 +759,23 @@ class VisionPipeline:
         return np.empty((0, 4)), np.empty(0), None
 
     def _detect_yolo(self, frame):
-        results = self.model(frame, verbose=False, half=self._yolo_half)
+        import torch
+
+        predict_kwargs = {
+            "verbose": False,
+            "half": self._yolo_half,
+            "conf": CONFIDENCE_THRESHOLD,
+            "classes": [0],
+            "max_det": 6,
+            "iou": 0.5,
+        }
+        if not self._yolo_is_engine:
+            predict_kwargs["imgsz"] = self._yolo_imgsz
+        if not self._yolo_is_engine:
+            predict_kwargs["device"] = self._yolo_device
+
+        with torch.inference_mode():
+            results = self.model(frame, **predict_kwargs)
         result = results[0]
 
         det_boxes = np.empty((0, 4))
@@ -597,6 +874,8 @@ class VisionPipeline:
             if t.z_depth_meters is not None:
                 occ_label += f"  [{t.z_depth_meters:.2f}m]"
                 n_depth += 1
+            if getattr(t, 'using_radar', False):
+                occ_label += f' [RADAR {t.radar_confidence:.0%}]'
             cv2.putText(vis, label, (x1, y1 - 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 2, cv2.LINE_AA)
             cv2.putText(vis, occ_label, (x1, y1 - 5),
@@ -609,6 +888,11 @@ class VisionPipeline:
             ):
                 n_occluded += 1
 
+        radar_points = []
+        if self.show_radar_overlay and self.projection is not None:
+            radar_points = self.radar_points()
+            self._draw_radar_overlay(vis, radar_points)
+
         # ── Info overlay (top-left) ─────────────────────────────────
         overlay_lines = [
             f"FPS: {self._fps_value:.1f}",
@@ -617,6 +901,9 @@ class VisionPipeline:
             f"Predicted: {n_predicted}",
             f"Recovered: {n_recovered}",
             f"Depth: {n_depth}/{len(tracks)}",
+            f"Radar Points: {len(radar_points)}",
+            f"Radar Fusion: {sum(1 for t in tracks if getattr(t, 'using_radar', False))}/{len(tracks)}",
+            f"Timing ms C:{self._timing['cam_ms']:.0f} D:{self._timing['detect_ms']:.0f} T:{self._timing['track_ms']:.0f} R:{self._timing['draw_ms']:.0f}",
         ]
         for i, line in enumerate(overlay_lines):
             cv2.putText(vis, line, (10, 25 + i * 25),
@@ -628,6 +915,164 @@ class VisionPipeline:
             cv2.putText(vis, "STATE: ALL VISIBLE", (10, vis.shape[0] - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                         (0, 255, 0), 2, cv2.LINE_AA)
+
+    def _draw_radar_overlay(self, vis, radar_points) -> None:
+        if self.projection is None or not radar_points:
+            return
+
+        h_frame, w_frame = vis.shape[:2]
+        for point, u, v in self.projection.project_points(radar_points):
+            if u < 0 or v < 0 or u >= w_frame or v >= h_frame:
+                continue
+            snr_scale = max(0.2, min(point.snr / 20.0, 1.0))
+            colour = (0, int(200 * snr_scale), 255)
+            cv2.circle(vis, (u, v), 5, colour, -1, cv2.LINE_AA)
+            cv2.circle(vis, (u, v), 10, colour, 1, cv2.LINE_AA)
+            cv2.putText(
+                vis,
+                f"{point.y:.2f}m",
+                (u + 8, v - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                colour,
+                1,
+                cv2.LINE_AA,
+            )
+
+
+class RadarCalibrationWindow:
+    """Live radar-to-camera calibration controls."""
+
+    PARAM_SPECS = [
+        ("fx", "fx", 200.0, 2000.0, 5.0),
+        ("fy", "fy", 200.0, 2000.0, 5.0),
+        ("cx", "cx", 0.0, 1920.0, 2.0),
+        ("cy", "cy", 0.0, 1080.0, 2.0),
+        ("tx", "tx", -2.0, 2.0, 0.01),
+        ("ty", "ty", -2.0, 2.0, 0.01),
+        ("tz", "tz", -2.0, 2.0, 0.01),
+        ("yaw_deg", "yaw", -90.0, 90.0, 0.1),
+        ("pitch_deg", "pitch", -90.0, 90.0, 0.1),
+        ("roll_deg", "roll", -90.0, 90.0, 0.1),
+    ]
+
+    def __init__(self, root: tk.Tk, pipeline: VisionPipeline):
+        self.root = root
+        self.pipeline = pipeline
+        self.window = tk.Toplevel(root)
+        self.window.title("Radar Calibration")
+        self.window.configure(bg="#1e1e2e")
+        self.window.geometry("720x520")
+        self.window.resizable(False, True)
+
+        self.status_var = tk.StringVar(
+            value=f"Save path: {CameraProjection.DEFAULT_PATH}"
+        )
+        self._vars = {}
+        self._suspend_callbacks = False
+
+        container = ttk.Frame(self.window)
+        container.pack(fill="both", expand=True, padx=10, pady=10)
+
+        ttk.Label(
+            container,
+            text="Radar To Camera Calibration",
+            style="Header.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            container,
+            text="Adjust the projected radar cloud until the dots sit on people in the camera view.",
+            style="Status.TLabel",
+            wraplength=660,
+        ).pack(anchor="w", pady=(0, 10))
+
+        grid = ttk.Frame(container)
+        grid.pack(fill="both", expand=True)
+        grid.columnconfigure(2, weight=1)
+
+        for row_idx, (key, label, low, high, resolution) in enumerate(self.PARAM_SPECS):
+            ttk.Label(grid, text=label.upper(), width=9).grid(
+                row=row_idx, column=0, sticky="w", padx=(0, 8), pady=3
+            )
+            var = tk.DoubleVar(value=0.0)
+            self._vars[key] = var
+            scale = tk.Scale(
+                grid,
+                from_=low,
+                to=high,
+                resolution=resolution,
+                orient="horizontal",
+                variable=var,
+                length=380,
+                bg="#1e1e2e",
+                fg="#cdd6f4",
+                troughcolor="#313244",
+                highlightthickness=0,
+                activebackground="#89b4fa",
+            )
+            scale.grid(row=row_idx, column=1, sticky="ew", padx=(0, 8), pady=2)
+            entry = ttk.Entry(grid, textvariable=var, width=10)
+            entry.grid(row=row_idx, column=2, sticky="w", pady=2)
+            var.trace_add("write", self._on_change)
+
+        btn_row = ttk.Frame(container)
+        btn_row.pack(fill="x", pady=(10, 6))
+        ttk.Button(btn_row, text="Load Saved", command=self._load).pack(side="left")
+        ttk.Button(btn_row, text="Save", command=self._save).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Reset", command=self._reset).pack(side="left")
+        ttk.Button(btn_row, text="Sync From Live", command=self.sync_from_pipeline).pack(
+            side="left", padx=6
+        )
+
+        ttk.Label(
+            container,
+            textvariable=self.status_var,
+            style="Status.TLabel",
+            wraplength=660,
+        ).pack(anchor="w")
+
+        self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
+        self.sync_from_pipeline()
+
+    def sync_from_pipeline(self) -> None:
+        params = self.pipeline.projection_params()
+        self._suspend_callbacks = True
+        try:
+            for key, var in self._vars.items():
+                if key in params:
+                    var.set(params[key])
+        finally:
+            self._suspend_callbacks = False
+
+    def _on_change(self, *_args) -> None:
+        if self._suspend_callbacks:
+            return
+        params = {key: var.get() for key, var in self._vars.items()}
+        self.pipeline.apply_projection_params(**params)
+        self.status_var.set(
+            "Live calibration applied. Tune until radar dots align with people."
+        )
+
+    def _save(self) -> None:
+        path = self.pipeline.save_projection()
+        self.status_var.set(f"Saved radar calibration to {path}")
+
+    def _load(self) -> None:
+        try:
+            path = self.pipeline.load_projection()
+            self.sync_from_pipeline()
+            self.status_var.set(f"Loaded radar calibration from {path}")
+        except FileNotFoundError:
+            self.status_var.set(
+                f"No saved calibration at {CameraProjection.DEFAULT_PATH}"
+            )
+        except Exception as exc:
+            self.status_var.set(f"Load failed: {exc}")
+
+    def _reset(self) -> None:
+        self.pipeline.reset_projection()
+        self.sync_from_pipeline()
+        self.status_var.set("Calibration reset to defaults")
 
 
 # ── Tkinter GUI ─────────────────────────────────────────────────────
@@ -655,6 +1100,7 @@ class FalconGUI:
 
     def __init__(self):
         self.pipeline = VisionPipeline()
+        self.calibration_window: Optional[RadarCalibrationWindow] = None
 
         # ── Root window ─────────────────────────────────────────────
         self.root = tk.Tk()
@@ -662,6 +1108,8 @@ class FalconGUI:
         self.root.configure(bg="#1e1e2e")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.minsize(960, 540)
+        self.root.geometry('1280x720')
+        self.root.resizable(False, False)
 
         # ── Style ───────────────────────────────────────────────────
         style = ttk.Style()
@@ -728,7 +1176,12 @@ class FalconGUI:
         ttk.Label(ctrl, text="Detection Model:").grid(
             row=2, column=0, sticky="w", pady=(0, 2))
 
-        self.model_var = tk.StringVar(value="YOLO26 Nano (Default)")
+        default_model = (
+            "YOLO26 Nano (TensorRT)"
+            if Path("yolo26n-pose.engine").exists()
+            else "YOLO26 Nano (Default)"
+        )
+        self.model_var = tk.StringVar(value=default_model)
         model_cb = ttk.Combobox(
             ctrl, textvariable=self.model_var,
             values=list(MODEL_OPTIONS.keys()),
@@ -738,7 +1191,7 @@ class FalconGUI:
 
         # Show model description beneath the dropdown
         self.model_desc_var = tk.StringVar(
-            value=MODEL_OPTIONS["YOLO26 Nano (Default)"]["description"])
+            value=MODEL_OPTIONS[default_model]["description"])
         self.model_desc_label = ttk.Label(
             ctrl, textvariable=self.model_desc_var, style="Status.TLabel",
             wraplength=250)
@@ -750,7 +1203,8 @@ class FalconGUI:
             row=5, column=0, sticky="w", pady=(0, 2))
 
         cam_labels = [c["label"] for c in _CAMERA_LIST]
-        self.cam_var = tk.StringVar(value=cam_labels[0] if cam_labels else "Webcam 0")
+        default_cam = "Intel RealSense (Auto)" if "Intel RealSense (Auto)" in cam_labels else (cam_labels[0] if cam_labels else "Webcam 0")
+        self.cam_var = tk.StringVar(value=default_cam)
         cam_cb = ttk.Combobox(
             ctrl, textvariable=self.cam_var,
             values=cam_labels,
@@ -791,19 +1245,34 @@ class FalconGUI:
                         command=self._sync_toggles
                         ).grid(row=11, column=0, sticky="w", pady=2)
 
+        self.radar_overlay_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ctrl, text="Show Radar Overlay",
+                        variable=self.radar_overlay_var,
+                        command=self._sync_toggles
+                        ).grid(row=12, column=0, sticky="w", pady=2)
+
+        ttk.Button(ctrl, text="Radar Calibrator",
+                   command=self._open_calibration_window
+                   ).grid(row=13, column=0, sticky="ew", pady=(10, 0))
+
         # ── Status bar ──────────────────────────────────────────────
         sep2 = ttk.Separator(ctrl, orient="horizontal")
-        sep2.grid(row=13, column=0, sticky="ew", pady=(16, 10))
+        sep2.grid(row=14, column=0, sticky="ew", pady=(16, 10))
 
         self.status_var = tk.StringVar(value="Status: Idle")
         ttk.Label(ctrl, textvariable=self.status_var,
                   style="Status.TLabel", wraplength=250
-                  ).grid(row=14, column=0, sticky="w")
+                  ).grid(row=15, column=0, sticky="w")
 
         self.fps_var = tk.StringVar(value="FPS: --")
         ttk.Label(ctrl, textvariable=self.fps_var,
                   style="Status.TLabel"
-                  ).grid(row=15, column=0, sticky="w", pady=(4, 0))
+                  ).grid(row=16, column=0, sticky="w", pady=(4, 0))
+
+        self.radar_var = tk.StringVar(value="Radar: --")
+        ttk.Label(ctrl, textvariable=self.radar_var,
+                  style="Status.TLabel", wraplength=250
+                  ).grid(row=17, column=0, sticky="w", pady=(4, 0))
 
         # ── Photo image reference (prevent GC) ──────────────────────
         self._photo: Optional[ImageTk.PhotoImage] = None
@@ -817,16 +1286,22 @@ class FalconGUI:
     def _sync_toggles(self):
         self.pipeline.show_skeleton = self.skel_var.get()
         self.pipeline.show_predictions = self.pred_var.get()
+        self.pipeline.show_radar_overlay = self.radar_overlay_var.get()
+
+    def _open_calibration_window(self):
+        if self.calibration_window is not None:
+            try:
+                if self.calibration_window.window.winfo_exists():
+                    self.calibration_window.window.lift()
+                    self.calibration_window.sync_from_pipeline()
+                    return
+            except tk.TclError:
+                self.calibration_window = None
+        self.calibration_window = RadarCalibrationWindow(self.root, self.pipeline)
 
     def _on_start(self):
-        self.status_var.set("Status: Loading model...")
+        self.status_var.set("Status: Opening camera...")
         self.root.update_idletasks()
-
-        # Load model
-        err = self.pipeline.load_model(self.model_var.get())
-        if err:
-            self.status_var.set(f"Error: {err}")
-            return
 
         # Open camera from dropdown selection
         cam_label = self.cam_var.get()
@@ -839,11 +1314,27 @@ class FalconGUI:
             self.status_var.set("Error: Cannot open camera")
             return
 
+        self.status_var.set("Status: Loading model...")
+        self.root.update_idletasks()
+
+        # Load model after camera succeeds so bad camera indices fail cleanly
+        err = self.pipeline.load_model(self.model_var.get())
+        if err:
+            self.pipeline.close_camera()
+            self.status_var.set(f"Error: {err}")
+            return
+
         # Sync toggle state
         self._sync_toggles()
 
         # Start pipeline
         self.pipeline.start()
+        if self.calibration_window is not None:
+            try:
+                if self.calibration_window.window.winfo_exists():
+                    self.calibration_window.sync_from_pipeline()
+            except tk.TclError:
+                self.calibration_window = None
 
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -858,6 +1349,7 @@ class FalconGUI:
         self.stop_btn.configure(state="disabled")
         self.status_var.set("Status: Stopped")
         self.fps_var.set("FPS: --")
+        self.radar_var.set("Radar: --")
         self.video_label.configure(image="", text="No Video Feed")
         self._photo = None
 
@@ -895,6 +1387,7 @@ class FalconGUI:
 
             # Update FPS readout
             self.fps_var.set(f"FPS: {self.pipeline.fps:.1f}")
+            self.radar_var.set(self.pipeline.radar_status_text())
 
         self.root.after(self.REFRESH_MS, self._refresh)
 
@@ -913,4 +1406,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
