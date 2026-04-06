@@ -3,8 +3,8 @@
 Standalone diagnostic viewer for the TI IWR6843ISK radar.
 
 The app owns sensor startup in live mode, loads TI replay JSON in replay mode,
-and renders two synchronized views of the point cloud while surfacing CLI logs,
-health verdicts, and low-level UART diagnostics.
+and renders a TI-Visualizer-style 3-D radar view plus orthographic support
+views while surfacing CLI logs, health verdicts, and low-level UART diagnostics.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import threading
 import tkinter as tk
+from collections import defaultdict, deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Optional
@@ -27,8 +28,10 @@ from radar import (
     HEALTH_REPLAY_MODE,
     FrameSource,
     IWR6843Driver,
+    RadarBox3D,
     RadarFrame,
     RadarSessionState,
+    RadarTrack,
     ReplayRadarSource,
     SerialPortInfo,
     discover_serial_ports,
@@ -46,28 +49,41 @@ class RadarViewerApp:
         cfg_path: str,
         config_port: str,
         data_port: str,
+        config_baud: int,
+        data_baud: int,
     ):
         self.root = root
         self.root.title("IWR6843 Diagnostic Viewer")
-        self.root.geometry("1440x920")
+        self.root.geometry("1580x980")
 
         self._source: Optional[FrameSource] = None
         self._port_infos: list[SerialPortInfo] = []
         self._busy = False
         self._last_drawn_key: Optional[tuple[str, int]] = None
         self._last_cli_text = ""
+        self._view_elev = 18.0
+        self._view_azim = -68.0
+        self._track_histories: dict[int, deque[tuple[float, float, float]]] = defaultdict(
+            lambda: deque(maxlen=25)
+        )
+        self._track_last_seen: dict[int, int] = {}
 
         self.mode_var = tk.StringVar(value=mode)
         self.config_port_var = tk.StringVar(value=config_port)
         self.data_port_var = tk.StringVar(value=data_port)
         self.cfg_path_var = tk.StringVar(value=cfg_path)
         self.replay_path_var = tk.StringVar(value=replay_path)
+        self.config_baud_var = tk.IntVar(value=config_baud)
+        self.data_baud_var = tk.IntVar(value=data_baud)
+        self.color_mode_var = tk.StringVar(value="velocity")
         self.suggestion_var = tk.StringVar(value="Suggested pair: none")
         self.status_banner_var = tk.StringVar(value="Idle")
 
         self.health_var = tk.StringVar(value="")
         self.reason_var = tk.StringVar(value="")
         self.frames_var = tk.StringVar(value="0")
+        self.tracks_var = tk.StringVar(value="0")
+        self.presence_var = tk.StringVar(value="")
         self.fps_var = tk.StringVar(value="0.00")
         self.rx_var = tk.StringVar(value="0")
         self.magic_var = tk.StringVar(value="0")
@@ -112,13 +128,19 @@ class RadarViewerApp:
         ttk.Label(live_box, text="Data Port").grid(row=1, column=0, sticky="w", padx=8, pady=4)
         self.data_port_combo = ttk.Combobox(live_box, textvariable=self.data_port_var, state="readonly")
         self.data_port_combo.grid(row=1, column=1, sticky="ew", padx=8, pady=4)
-        ttk.Label(live_box, text="Cfg File").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        ttk.Label(live_box, text="Config Baud").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        self.config_baud_entry = ttk.Entry(live_box, textvariable=self.config_baud_var, width=10)
+        self.config_baud_entry.grid(row=2, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(live_box, text="Data Baud").grid(row=3, column=0, sticky="w", padx=8, pady=4)
+        self.data_baud_entry = ttk.Entry(live_box, textvariable=self.data_baud_var, width=10)
+        self.data_baud_entry.grid(row=3, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(live_box, text="Cfg File").grid(row=4, column=0, sticky="w", padx=8, pady=4)
         self.cfg_entry = ttk.Entry(live_box, textvariable=self.cfg_path_var)
-        self.cfg_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
+        self.cfg_entry.grid(row=4, column=1, sticky="ew", padx=8, pady=4)
         self.cfg_button = ttk.Button(live_box, text="Browse", command=self._browse_cfg)
-        self.cfg_button.grid(row=2, column=2, sticky="ew", padx=(0, 8), pady=4)
+        self.cfg_button.grid(row=4, column=2, sticky="ew", padx=(0, 8), pady=4)
         self.refresh_ports_button = ttk.Button(live_box, text="Refresh Ports", command=self.refresh_ports)
-        self.refresh_ports_button.grid(row=3, column=1, sticky="w", padx=8, pady=(4, 8))
+        self.refresh_ports_button.grid(row=5, column=1, sticky="w", padx=8, pady=(4, 8))
 
         replay_box = ttk.LabelFrame(controls, text="Replay Setup")
         replay_box.grid(row=0, column=2, sticky="nsew", padx=8)
@@ -139,7 +161,17 @@ class RadarViewerApp:
         self.disconnect_button.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
         self.probe_button = ttk.Button(action_box, text="Probe Startup", command=self._probe_startup)
         self.probe_button.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
-        ttk.Label(action_box, textvariable=self.status_banner_var, wraplength=260).grid(row=3, column=0, sticky="w", padx=8, pady=(6, 8))
+        ttk.Label(action_box, text="Color By").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 2))
+        self.color_mode_combo = ttk.Combobox(
+            action_box,
+            textvariable=self.color_mode_var,
+            state="readonly",
+            values=("velocity", "snr"),
+        )
+        self.color_mode_combo.grid(row=4, column=0, sticky="ew", padx=8, pady=2)
+        self.reset_view_button = ttk.Button(action_box, text="Reset 3D View", command=self._reset_3d_view)
+        self.reset_view_button.grid(row=5, column=0, sticky="ew", padx=8, pady=(4, 4))
+        ttk.Label(action_box, textvariable=self.status_banner_var, wraplength=260).grid(row=6, column=0, sticky="w", padx=8, pady=(6, 8))
 
         body = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         body.grid(row=1, column=0, sticky="nsew")
@@ -162,30 +194,35 @@ class RadarViewerApp:
 
         self._add_status_pair(status_box, 0, 0, "Health", self.health_var)
         self._add_status_pair(status_box, 0, 1, "Frames", self.frames_var)
-        self._add_status_pair(status_box, 0, 2, "FPS", self.fps_var)
-        self._add_status_pair(status_box, 0, 3, "Config OK", self.config_ok_var)
+        self._add_status_pair(status_box, 0, 2, "Tracks", self.tracks_var)
+        self._add_status_pair(status_box, 0, 3, "Presence", self.presence_var)
 
         self._add_status_pair(status_box, 1, 0, "RX Bytes", self.rx_var)
         self._add_status_pair(status_box, 1, 1, "Magic Hits", self.magic_var)
-        self._add_status_pair(status_box, 1, 2, "Last Packet", self.packet_var)
-        self._add_status_pair(status_box, 1, 3, "Plots Updating", self.plots_var)
+        self._add_status_pair(status_box, 1, 2, "FPS", self.fps_var)
+        self._add_status_pair(status_box, 1, 3, "Config OK", self.config_ok_var)
 
-        self._add_status_pair(status_box, 2, 0, "Reason", self.reason_var, span=4)
-        self._add_status_pair(status_box, 3, 0, "Parse Error", self.parse_error_var, span=4)
-        self._add_status_pair(status_box, 4, 0, "Command Error", self.command_error_var, span=4)
-        self._add_status_pair(status_box, 5, 0, "Connection Error", self.connection_error_var, span=4)
-        self._add_status_pair(status_box, 6, 0, "Unknown TLVs", self.unknown_tlvs_var, span=4)
-        self._add_status_pair(status_box, 7, 0, "Probe Result", self.probe_var, span=4)
-        self._add_status_pair(status_box, 8, 0, "Run Dir", self.run_dir_var, span=4)
+        self._add_status_pair(status_box, 2, 0, "Last Packet", self.packet_var)
+        self._add_status_pair(status_box, 2, 1, "Plots Updating", self.plots_var)
 
-        plot_box = ttk.LabelFrame(left, text="Point Cloud")
+        self._add_status_pair(status_box, 3, 0, "Reason", self.reason_var, span=4)
+        self._add_status_pair(status_box, 4, 0, "Parse Error", self.parse_error_var, span=4)
+        self._add_status_pair(status_box, 5, 0, "Command Error", self.command_error_var, span=4)
+        self._add_status_pair(status_box, 6, 0, "Connection Error", self.connection_error_var, span=4)
+        self._add_status_pair(status_box, 7, 0, "Unknown TLVs", self.unknown_tlvs_var, span=4)
+        self._add_status_pair(status_box, 8, 0, "Probe Result", self.probe_var, span=4)
+        self._add_status_pair(status_box, 9, 0, "Run Dir", self.run_dir_var, span=4)
+
+        plot_box = ttk.LabelFrame(left, text="3D Radar View")
         plot_box.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
         plot_box.columnconfigure(0, weight=1)
         plot_box.rowconfigure(0, weight=1)
 
-        self.figure = Figure(figsize=(8.2, 6.4), dpi=100)
-        self.top_ax = self.figure.add_subplot(121)
-        self.side_ax = self.figure.add_subplot(122)
+        self.figure = Figure(figsize=(9.8, 7.0), dpi=100)
+        grid = self.figure.add_gridspec(2, 2, width_ratios=[2.3, 1.0], height_ratios=[1.0, 1.0])
+        self.main3d_ax = self.figure.add_subplot(grid[:, 0], projection="3d")
+        self.top_ax = self.figure.add_subplot(grid[0, 1])
+        self.side_ax = self.figure.add_subplot(grid[1, 1])
         self.figure.tight_layout(pad=2.0)
         self.canvas = FigureCanvasTkAgg(self.figure, master=plot_box)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
@@ -213,7 +250,7 @@ class RadarViewerApp:
             help_box,
             text=(
                 "Healthy requires: cfg success, magic hits, at least 3 parsed frames "
-                "within 5 seconds, and plots updating."
+                "within 5 seconds, live 3D updates, and rendered plots."
             ),
             wraplength=420,
         ).grid(row=0, column=0, sticky="w", padx=8, pady=8)
@@ -227,6 +264,7 @@ class RadarViewerApp:
         self.notes_text.insert(
             "1.0",
             "Use live mode to prove board health and replay mode to compare against saved TI captures.\n"
+            "Drag the 3D plot to rotate it. Points can be colored by velocity or SNR, and tracked people render with IDs, boxes, and short motion trails.\n"
             "The Probe Startup action reruns the cfg in staged blocks and reports the first failing stage.",
         )
         self.notes_text.configure(state="disabled")
@@ -253,8 +291,17 @@ class RadarViewerApp:
         widget.configure(state="disabled")
 
     def _draw_empty_plots(self) -> None:
+        self.main3d_ax.clear()
         self.top_ax.clear()
         self.side_ax.clear()
+        self.main3d_ax.set_title("3D Point Cloud")
+        self.main3d_ax.set_xlabel("X (m)")
+        self.main3d_ax.set_ylabel("Y (m)")
+        self.main3d_ax.set_zlabel("Z (m)")
+        self.main3d_ax.set_xlim(-4.0, 4.0)
+        self.main3d_ax.set_ylim(0.0, 8.0)
+        self.main3d_ax.set_zlim(-0.2, 3.5)
+        self.main3d_ax.grid(True, alpha=0.2)
         self.top_ax.set_title("Top Down (X/Y)")
         self.top_ax.set_xlabel("X (m)")
         self.top_ax.set_ylabel("Y (m)")
@@ -269,12 +316,26 @@ class RadarViewerApp:
         self.side_ax.grid(True, alpha=0.3)
         self.side_ax.set_xlim(0.0, 8.0)
         self.side_ax.set_ylim(-1.0, 3.5)
+        self._reset_3d_view()
         self.canvas.draw_idle()
 
     def _draw_frame(self, source_mode: str, frame: RadarFrame) -> None:
         points = frame.points
+        tracks = frame.tracks
+        self._update_track_history(frame)
+        if hasattr(self, "main3d_ax"):
+            self._view_elev = float(getattr(self.main3d_ax, "elev", self._view_elev))
+            self._view_azim = float(getattr(self.main3d_ax, "azim", self._view_azim))
+
+        self.main3d_ax.clear()
         self.top_ax.clear()
         self.side_ax.clear()
+
+        self.main3d_ax.set_title("3D Point Cloud")
+        self.main3d_ax.set_xlabel("X (m)")
+        self.main3d_ax.set_ylabel("Y (m)")
+        self.main3d_ax.set_zlabel("Z (m)")
+        self.main3d_ax.grid(True, alpha=0.2)
 
         self.top_ax.set_title("Top Down (X/Y)")
         self.top_ax.set_xlabel("X (m)")
@@ -286,32 +347,175 @@ class RadarViewerApp:
         self.side_ax.set_ylabel("Z (m)")
         self.side_ax.grid(True, alpha=0.3)
 
+        color_mode = self.color_mode_var.get().strip().lower()
         if points:
             xs = [point.x for point in points]
             ys = [point.y for point in points]
             zs = [point.z for point in points]
-            velocities = [point.velocity for point in points]
-            vmax = max(1.0, max(abs(value) for value in velocities))
-            self.top_ax.scatter(xs, ys, c=velocities, cmap="coolwarm", vmin=-vmax, vmax=vmax, s=28, alpha=0.9)
-            self.side_ax.scatter(ys, zs, c=velocities, cmap="coolwarm", vmin=-vmax, vmax=vmax, s=28, alpha=0.9)
+            metric = [point.snr for point in points] if color_mode == "snr" else [point.velocity for point in points]
+            if color_mode == "snr":
+                vmin = min(metric)
+                vmax = max(metric) if metric else 1.0
+                cmap = "viridis"
+            else:
+                vmax = max(1.0, max(abs(value) for value in metric))
+                vmin = -vmax
+                cmap = "coolwarm"
 
-            x_margin = max(1.0, (max(xs) - min(xs)) * 0.2)
-            y_margin = max(1.0, (max(ys) - min(ys)) * 0.2)
-            z_margin = max(0.5, (max(zs) - min(zs)) * 0.2)
-            self.top_ax.set_xlim(min(xs) - x_margin, max(xs) + x_margin)
-            self.top_ax.set_ylim(min(0.0, min(ys) - y_margin), max(8.0, max(ys) + y_margin))
-            self.side_ax.set_xlim(min(0.0, min(ys) - y_margin), max(8.0, max(ys) + y_margin))
-            self.side_ax.set_ylim(min(-1.0, min(zs) - z_margin), max(3.5, max(zs) + z_margin))
-        else:
+            self.main3d_ax.scatter(xs, ys, zs, c=metric, cmap=cmap, vmin=vmin, vmax=vmax, s=18, alpha=0.78, depthshade=True)
+            self.top_ax.scatter(xs, ys, c=metric, cmap=cmap, vmin=vmin, vmax=vmax, s=22, alpha=0.88)
+            self.side_ax.scatter(ys, zs, c=metric, cmap=cmap, vmin=vmin, vmax=vmax, s=22, alpha=0.88)
+
+        self._draw_scene_boxes(frame)
+        self._draw_tracks(frame)
+        self._apply_frame_limits(frame)
+
+        if hasattr(self.main3d_ax, "set_box_aspect"):
+            self.main3d_ax.set_box_aspect((1.0, 1.4, 0.8))
+        self.main3d_ax.view_init(elev=self._view_elev, azim=self._view_azim)
+
+        label = (
+            f"{source_mode.capitalize()} frame {frame.frame_number} | "
+            f"points={len(points)} | tracks={len(tracks)} | color={color_mode}"
+        )
+        self.figure.suptitle(label)
+        self.figure.tight_layout(rect=(0, 0, 1, 0.97))
+        self.canvas.draw_idle()
+
+    def _update_track_history(self, frame: RadarFrame) -> None:
+        seen_ids = set()
+        for track in frame.tracks:
+            self._track_histories[track.track_id].append((track.x, track.y, track.z))
+            self._track_last_seen[track.track_id] = frame.frame_number
+            seen_ids.add(track.track_id)
+        stale_ids = [
+            track_id
+            for track_id, last_frame in self._track_last_seen.items()
+            if frame.frame_number - last_frame > 40
+        ]
+        for track_id in stale_ids:
+            self._track_last_seen.pop(track_id, None)
+            self._track_histories.pop(track_id, None)
+
+    def _draw_scene_boxes(self, frame: RadarFrame) -> None:
+        sensor_height = frame.scene.sensor_height_m
+        self.main3d_ax.scatter([0.0], [0.0], [sensor_height], c="black", s=30, marker="^")
+        self.main3d_ax.text(0.0, 0.0, sensor_height + 0.1, "Radar", color="black")
+        for box in frame.scene.static_boundary_boxes:
+            self._plot_box(box, color="#7f8c8d", linestyle=":")
+        for box in frame.scene.boundary_boxes:
+            self._plot_box(box, color="#1f77b4", linestyle="--")
+        for box in frame.scene.presence_boxes:
+            self._plot_box(box, color="#ff7f0e", linestyle="-.")
+
+    def _draw_tracks(self, frame: RadarFrame) -> None:
+        for track in frame.tracks:
+            color = self._track_color(track)
+            self.main3d_ax.scatter([track.x], [track.y], [track.z], c=[color], s=64, marker="o", edgecolors="black", linewidths=0.6)
+            self.top_ax.scatter([track.x], [track.y], c=[color], s=56, marker="o", edgecolors="black", linewidths=0.6)
+            self.side_ax.scatter([track.y], [track.z], c=[color], s=56, marker="o", edgecolors="black", linewidths=0.6)
+            self.main3d_ax.text(track.x, track.y, track.z + 0.12, f"ID {track.track_id}", color=color)
+            self.top_ax.text(track.x, track.y + 0.08, f"{track.track_id}", color=color, fontsize=9)
+            self.side_ax.text(track.y, track.z + 0.08, f"{track.track_id}", color=color, fontsize=9)
+            if track.bbox is not None:
+                self._plot_box(track.bbox, color=color, linestyle="-")
+
+            history = list(self._track_histories.get(track.track_id, ()))
+            if len(history) >= 2:
+                xs = [p[0] for p in history]
+                ys = [p[1] for p in history]
+                zs = [p[2] for p in history]
+                self.main3d_ax.plot(xs, ys, zs, color=color, alpha=0.55, linewidth=1.6)
+                self.top_ax.plot(xs, ys, color=color, alpha=0.55, linewidth=1.4)
+                self.side_ax.plot(ys, zs, color=color, alpha=0.55, linewidth=1.4)
+
+    def _plot_box(self, box: RadarBox3D, *, color: str, linestyle: str) -> None:
+        x0, x1 = box.x_min, box.x_max
+        y0, y1 = box.y_min, box.y_max
+        z0, z1 = box.z_min, box.z_max
+        corners = [
+            (x0, y0, z0),
+            (x1, y0, z0),
+            (x1, y1, z0),
+            (x0, y1, z0),
+            (x0, y0, z1),
+            (x1, y0, z1),
+            (x1, y1, z1),
+            (x0, y1, z1),
+        ]
+        edges = (
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        )
+        for a, b in edges:
+            xa, ya, za = corners[a]
+            xb, yb, zb = corners[b]
+            self.main3d_ax.plot([xa, xb], [ya, yb], [za, zb], color=color, linestyle=linestyle, linewidth=1.2, alpha=0.9)
+
+        self.top_ax.plot([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0], color=color, linestyle=linestyle, linewidth=1.1, alpha=0.85)
+        self.side_ax.plot([y0, y1, y1, y0, y0], [z0, z0, z1, z1, z0], color=color, linestyle=linestyle, linewidth=1.1, alpha=0.85)
+
+    def _track_color(self, track: RadarTrack) -> str:
+        palette = (
+            "#d62728",
+            "#2ca02c",
+            "#ff7f0e",
+            "#1f77b4",
+            "#8c564b",
+            "#17becf",
+            "#e377c2",
+            "#bcbd22",
+        )
+        return palette[track.track_id % len(palette)]
+
+    def _apply_frame_limits(self, frame: RadarFrame) -> None:
+        xs: list[float] = [point.x for point in frame.points]
+        ys: list[float] = [point.y for point in frame.points]
+        zs: list[float] = [point.z for point in frame.points]
+
+        for track in frame.tracks:
+            xs.append(track.x)
+            ys.append(track.y)
+            zs.append(track.z)
+            if track.bbox is not None:
+                xs.extend([track.bbox.x_min, track.bbox.x_max])
+                ys.extend([track.bbox.y_min, track.bbox.y_max])
+                zs.extend([track.bbox.z_min, track.bbox.z_max])
+
+        for box in frame.scene.all_boxes():
+            xs.extend([box.x_min, box.x_max])
+            ys.extend([box.y_min, box.y_max])
+            zs.extend([box.z_min, box.z_max])
+
+        if not xs or not ys or not zs:
+            self.main3d_ax.set_xlim(-4.0, 4.0)
+            self.main3d_ax.set_ylim(0.0, 8.0)
+            self.main3d_ax.set_zlim(-0.2, 3.5)
             self.top_ax.set_xlim(-4.0, 4.0)
             self.top_ax.set_ylim(0.0, 8.0)
             self.side_ax.set_xlim(0.0, 8.0)
             self.side_ax.set_ylim(-1.0, 3.5)
+            return
 
-        label = f"{source_mode.capitalize()} frame {frame.frame_number} | points={len(points)}"
-        self.figure.suptitle(label)
-        self.figure.tight_layout(rect=(0, 0, 1, 0.97))
-        self.canvas.draw_idle()
+        x_margin = max(0.8, (max(xs) - min(xs)) * 0.2)
+        y_margin = max(0.8, (max(ys) - min(ys)) * 0.2)
+        z_margin = max(0.5, (max(zs) - min(zs)) * 0.2)
+        self.main3d_ax.set_xlim(min(xs) - x_margin, max(xs) + x_margin)
+        self.main3d_ax.set_ylim(min(0.0, min(ys) - y_margin), max(8.0, max(ys) + y_margin))
+        self.main3d_ax.set_zlim(min(-0.2, min(zs) - z_margin), max(3.5, max(zs) + z_margin))
+        self.top_ax.set_xlim(min(xs) - x_margin, max(xs) + x_margin)
+        self.top_ax.set_ylim(min(0.0, min(ys) - y_margin), max(8.0, max(ys) + y_margin))
+        self.side_ax.set_xlim(min(0.0, min(ys) - y_margin), max(8.0, max(ys) + y_margin))
+        self.side_ax.set_ylim(min(-1.0, min(zs) - z_margin), max(3.5, max(zs) + z_margin))
+
+    def _reset_3d_view(self) -> None:
+        self._view_elev = 18.0
+        self._view_azim = -68.0
+        if hasattr(self, "main3d_ax"):
+            self.main3d_ax.view_init(elev=self._view_elev, azim=self._view_azim)
+        if hasattr(self, "canvas"):
+            self.canvas.draw_idle()
 
     def refresh_ports(self) -> None:
         self._port_infos = discover_serial_ports()
@@ -403,6 +607,12 @@ class RadarViewerApp:
         replay_path = self.replay_path_var.get().strip()
         config_port = self.config_port_var.get().strip()
         data_port = self.data_port_var.get().strip()
+        try:
+            config_baud = int(self.config_baud_var.get())
+            data_baud = int(self.data_baud_var.get())
+        except (TypeError, ValueError):
+            messagebox.showwarning("Radar Viewer", "Config baud and data baud must be integers.")
+            return
 
         if mode == "live" and not cfg_path:
             messagebox.showwarning("Radar Viewer", "Choose a cfg file before connecting.")
@@ -419,12 +629,16 @@ class RadarViewerApp:
                 config_port=config_port,
                 data_port=data_port,
                 config_path=cfg_path,
+                config_baud=config_baud,
+                data_baud=data_baud,
             )
         else:
             source = ReplayRadarSource(replay_path)
 
         self._source = source
         self._last_drawn_key = None
+        self._track_histories.clear()
+        self._track_last_seen.clear()
 
         def worker() -> bool:
             return bool(source.start())
@@ -451,6 +665,8 @@ class RadarViewerApp:
             del result
             if error is None:
                 self.status_banner_var.set("Disconnected")
+            self._track_histories.clear()
+            self._track_last_seen.clear()
             self._refresh_state_panel()
 
         self._run_async("Disconnecting...", worker, done)
@@ -463,10 +679,18 @@ class RadarViewerApp:
         if isinstance(self._source, IWR6843Driver):
             source = self._source
         else:
+            try:
+                config_baud = int(self.config_baud_var.get())
+                data_baud = int(self.data_baud_var.get())
+            except (TypeError, ValueError):
+                messagebox.showwarning("Radar Viewer", "Config baud and data baud must be integers.")
+                return
             source = IWR6843Driver(
                 config_port=self.config_port_var.get().strip(),
                 data_port=self.data_port_var.get().strip(),
                 config_path=self.cfg_path_var.get().strip(),
+                config_baud=config_baud,
+                data_baud=data_baud,
             )
             self._source = source
 
@@ -503,6 +727,8 @@ class RadarViewerApp:
         self.health_var.set(state.health_verdict)
         self.reason_var.set(state.health_reason)
         self.frames_var.set(str(state.frames))
+        self.tracks_var.set(str(state.tracks))
+        self.presence_var.set(state.presence or "-")
         self.fps_var.set(f"{state.fps:.2f}")
         self.rx_var.set(str(state.rx_bytes))
         self.magic_var.set(str(state.magic_hits))
@@ -554,6 +780,8 @@ class RadarViewerApp:
 
         self.config_port_combo.configure(state="readonly" if live_enabled and not self._busy else "disabled")
         self.data_port_combo.configure(state="readonly" if live_enabled and not self._busy else "disabled")
+        self.config_baud_entry.configure(state="normal" if live_enabled and not self._busy else "disabled")
+        self.data_baud_entry.configure(state="normal" if live_enabled and not self._busy else "disabled")
         self.cfg_entry.configure(state="normal" if live_enabled and not self._busy else "disabled")
         self.cfg_button.configure(state="normal" if live_enabled and not self._busy else "disabled")
         self.refresh_ports_button.configure(state="normal" if live_enabled and not self._busy else "disabled")
@@ -568,6 +796,8 @@ class RadarViewerApp:
         self.probe_button.configure(
             state="normal" if live_enabled and not self._busy else "disabled"
         )
+        self.color_mode_combo.configure(state="readonly" if not self._busy else "disabled")
+        self.reset_view_button.configure(state="normal" if not self._busy else "disabled")
 
     def _on_close(self) -> None:
         try:
@@ -592,6 +822,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg", default=_default_cfg_path())
     parser.add_argument("--config-port", default="")
     parser.add_argument("--data-port", default="")
+    parser.add_argument("--config-baud", type=int, default=115200)
+    parser.add_argument("--data-baud", type=int, default=921600)
     return parser.parse_args()
 
 
@@ -605,6 +837,8 @@ def main() -> None:
         cfg_path=args.cfg,
         config_port=args.config_port,
         data_port=args.data_port,
+        config_baud=args.config_baud,
+        data_baud=args.data_baud,
     )
     root.mainloop()
 

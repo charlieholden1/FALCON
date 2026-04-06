@@ -8,7 +8,8 @@ RadarPoint
     Dataclass for a single detected radar point (x, y, z, velocity, snr).
 
 RadarFrame
-    Normalized frame shape shared by live UART sessions and replay sessions.
+    Normalized frame shape shared by live UART sessions and replay sessions,
+    including tracked targets, 3-D extents, and fusion-ready metadata.
 
 IWR6843Driver
     Driver for the TI IWR6843 mmWave sensor. Communicates over the
@@ -29,6 +30,7 @@ CameraProjection
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -64,6 +66,12 @@ HEADER_SIZE = 40
 TLV_HEADER_SIZE = 8
 TLV_DETECTED_OBJECTS = 1
 TLV_SIDE_INFO = 7
+TLV_COMPRESSED_POINTS = 6
+TLV_TRACK_LIST = 7
+TLV_TRACK_INDEX = 8
+TLV_TRACK_HEIGHT = 9
+TLV_PRESENCE = 10
+TLV_COMPRESSED_POINTS_LEGACY = 301
 
 HEALTH_HEALTHY = "Healthy"
 HEALTH_CONFIG_FAILED = "Config Failed"
@@ -77,6 +85,9 @@ _TLV_STRUCT = struct.Struct("<2I")
 _RAW_POINT_STRUCT = struct.Struct("<4f")
 _COMPRESSED_UNIT_STRUCT = struct.Struct("<5f")
 _COMPRESSED_POINT_STRUCT = struct.Struct("<bbHhH")
+_TRACK_RECORD_SHORT_STRUCT = struct.Struct("<I15f")
+_TRACK_RECORD_LONG_STRUCT = struct.Struct("<I27f")
+_TRACK_HEIGHT_STRUCT = struct.Struct("<I2f")
 
 _RUNS_DIR = Path("diagnostics_runs")
 _MAX_CLI_LOG_CHARS = 200000
@@ -110,6 +121,114 @@ class RadarPoint:
 
 
 @dataclass
+class RadarBox3D:
+    """Axis-aligned 3-D extent for tracks and configured scene volumes."""
+
+    x_min: float
+    x_max: float
+    y_min: float
+    y_max: float
+    z_min: float
+    z_max: float
+    label: str = ""
+    kind: str = "track"
+    track_id: Optional[int] = None
+
+    @property
+    def width(self) -> float:
+        return float(self.x_max - self.x_min)
+
+    @property
+    def depth(self) -> float:
+        return float(self.y_max - self.y_min)
+
+    @property
+    def height(self) -> float:
+        return float(self.z_max - self.z_min)
+
+    @property
+    def center(self) -> Tuple[float, float, float]:
+        return (
+            float((self.x_min + self.x_max) * 0.5),
+            float((self.y_min + self.y_max) * 0.5),
+            float((self.z_min + self.z_max) * 0.5),
+        )
+
+    @property
+    def center_3d(self) -> np.ndarray:
+        return np.array(self.center, dtype=np.float64)
+
+    def corners(self) -> List[np.ndarray]:
+        return [
+            np.array([x, y, z], dtype=np.float64)
+            for x in (self.x_min, self.x_max)
+            for y in (self.y_min, self.y_max)
+            for z in (self.z_min, self.z_max)
+        ]
+
+
+@dataclass
+class RadarTrack:
+    """Tracked target reported by TI's people-tracking pipeline."""
+
+    track_id: int
+    x: float
+    y: float
+    z: float
+    vx: float = 0.0
+    vy: float = 0.0
+    vz: float = 0.0
+    ax: float = 0.0
+    ay: float = 0.0
+    az: float = 0.0
+    state: int = 0
+    confidence: float = 0.0
+    bbox: Optional[RadarBox3D] = None
+    height_range: Optional[Tuple[float, float]] = None
+    associated_point_indexes: List[int] = field(default_factory=list)
+    extra_values: List[float] = field(default_factory=list)
+    raw_format: str = ""
+    bbox_source: str = ""
+
+    @property
+    def position(self) -> Tuple[float, float, float]:
+        return (float(self.x), float(self.y), float(self.z))
+
+    @property
+    def position_3d(self) -> np.ndarray:
+        return np.array(self.position, dtype=np.float64)
+
+    @property
+    def velocity_3d(self) -> np.ndarray:
+        return np.array([self.vx, self.vy, self.vz], dtype=np.float64)
+
+    @property
+    def speed(self) -> float:
+        return float(np.linalg.norm(self.velocity_3d))
+
+
+@dataclass
+class RadarSceneMetadata:
+    """Config-derived scene and calibration hints shared by live and replay."""
+
+    coordinate_frame: str = "radar_sensor_xyz"
+    sensor_height_m: float = 0.0
+    azimuth_tilt_deg: float = 0.0
+    elevation_tilt_deg: float = 0.0
+    config_source: str = ""
+    boundary_boxes: List[RadarBox3D] = field(default_factory=list)
+    static_boundary_boxes: List[RadarBox3D] = field(default_factory=list)
+    presence_boxes: List[RadarBox3D] = field(default_factory=list)
+
+    def all_boxes(self) -> List[RadarBox3D]:
+        return (
+            list(self.static_boundary_boxes)
+            + list(self.boundary_boxes)
+            + list(self.presence_boxes)
+        )
+
+
+@dataclass
 class RadarFrame:
     """One parsed frame from the radar logging UART or replay."""
 
@@ -120,6 +239,81 @@ class RadarFrame:
     points: List[RadarPoint]
     timestamp: float
     source_timestamp: float = 0.0
+    tracks: List[RadarTrack] = field(default_factory=list)
+    track_indexes: List[int] = field(default_factory=list)
+    presence: Optional[int] = None
+    coordinate_frame: str = "radar_sensor_xyz"
+    scene: RadarSceneMetadata = field(default_factory=RadarSceneMetadata)
+    calibration: Dict[str, Any] = field(default_factory=dict)
+
+    def fusion_ready_payload(self) -> Dict[str, Any]:
+        """Return a camera-fusion-friendly snapshot of this frame."""
+
+        return {
+            "frame_number": int(self.frame_number),
+            "subframe_number": int(self.subframe_number),
+            "timestamp": float(self.timestamp),
+            "source_timestamp": float(self.source_timestamp),
+            "coordinate_frame": self.coordinate_frame,
+            "points": [
+                {
+                    "x": float(point.x),
+                    "y": float(point.y),
+                    "z": float(point.z),
+                    "velocity": float(point.velocity),
+                    "snr": float(point.snr),
+                }
+                for point in self.points
+            ],
+            "tracks": [
+                {
+                    "track_id": int(track.track_id),
+                    "position": [float(track.x), float(track.y), float(track.z)],
+                    "velocity": [float(track.vx), float(track.vy), float(track.vz)],
+                    "acceleration": [float(track.ax), float(track.ay), float(track.az)],
+                    "confidence": float(track.confidence),
+                    "state": int(track.state),
+                    "bbox": None
+                    if track.bbox is None
+                    else {
+                        "x_min": float(track.bbox.x_min),
+                        "x_max": float(track.bbox.x_max),
+                        "y_min": float(track.bbox.y_min),
+                        "y_max": float(track.bbox.y_max),
+                        "z_min": float(track.bbox.z_min),
+                        "z_max": float(track.bbox.z_max),
+                    },
+                }
+                for track in self.tracks
+            ],
+            "presence": None if self.presence is None else int(self.presence),
+            "scene": asdict(self.scene),
+            "calibration": dict(self.calibration),
+        }
+
+    def project_to_camera(self, projection: "CameraProjection") -> Dict[str, Any]:
+        """Project points and track boxes into image space when calibration is available."""
+
+        points = [
+            {
+                "xyz": [float(point.x), float(point.y), float(point.z)],
+                "uv": list(projection.project_3d_to_2d(point.position_3d)),
+                "velocity": float(point.velocity),
+                "snr": float(point.snr),
+            }
+            for point in self.points
+        ]
+        tracks = []
+        for track in self.tracks:
+            bbox_2d = projection.project_box_3d(track.bbox) if track.bbox is not None else None
+            tracks.append(
+                {
+                    "track_id": int(track.track_id),
+                    "uv_center": list(projection.project_3d_to_2d(track.position_3d)),
+                    "uv_bbox": list(bbox_2d) if bbox_2d is not None else None,
+                }
+            )
+        return {"points": points, "tracks": tracks}
 
 
 @dataclass
@@ -138,6 +332,8 @@ class RadarSessionState:
     rx_bytes: int = 0
     magic_hits: int = 0
     frames: int = 0
+    tracks: int = 0
+    presence: str = ""
     fps: float = 0.0
     last_packet_size: int = 0
     last_parse_error: str = ""
@@ -193,6 +389,7 @@ class ReplayCapture:
     device: str
     frames: List[RadarFrame]
     schedule_s: List[float]
+    scene: RadarSceneMetadata = field(default_factory=RadarSceneMetadata)
 
 
 @dataclass
@@ -228,6 +425,66 @@ class FrameSource(ABC):
 
     def note_frame_rendered(self, frame: Optional[RadarFrame]) -> None:
         del frame
+
+
+def clone_radar_frame(frame: Optional[RadarFrame]) -> Optional[RadarFrame]:
+    if frame is None:
+        return None
+    return copy.deepcopy(frame)
+
+
+def scene_metadata_from_cfg_lines(
+    lines: Sequence[str],
+    *,
+    config_source: str = "",
+) -> RadarSceneMetadata:
+    """Extract scene volumes and sensor pose hints from cfg lines."""
+
+    scene = RadarSceneMetadata(config_source=config_source)
+    for raw_line in lines:
+        line = str(raw_line).strip()
+        if not line or line.startswith("%"):
+            continue
+        parts = line.split()
+        cmd = parts[0]
+        try:
+            values = [float(value) for value in parts[1:]]
+        except ValueError:
+            continue
+
+        if cmd == "sensorPosition" and len(values) >= 3:
+            scene.sensor_height_m = float(values[0])
+            scene.azimuth_tilt_deg = float(values[1])
+            scene.elevation_tilt_deg = float(values[2])
+            continue
+
+        if cmd in {"boundaryBox", "staticBoundaryBox", "presenceBoundaryBox"} and len(values) >= 6:
+            box = RadarBox3D(
+                x_min=float(values[0]),
+                x_max=float(values[1]),
+                y_min=float(values[2]),
+                y_max=float(values[3]),
+                z_min=float(values[4]),
+                z_max=float(values[5]),
+                label=cmd,
+                kind=cmd,
+            )
+            if cmd == "boundaryBox":
+                scene.boundary_boxes.append(box)
+            elif cmd == "staticBoundaryBox":
+                scene.static_boundary_boxes.append(box)
+            else:
+                scene.presence_boxes.append(box)
+    return scene
+
+
+def scene_metadata_from_cfg_path(path: Union[str, Path]) -> RadarSceneMetadata:
+    cfg_path = Path(path)
+    try:
+        lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return RadarSceneMetadata(config_source=str(cfg_path))
+    return scene_metadata_from_cfg_lines(lines, config_source=str(cfg_path))
 
 
 def open_serial_with_retries(
@@ -528,15 +785,308 @@ def evaluate_health_verdict(
     return HEALTH_NO_DATA, "Config succeeded, but the logging stream is still inconclusive."
 
 
+def _calibration_from_scene(scene: RadarSceneMetadata) -> Dict[str, Any]:
+    return {
+        "coordinate_frame": scene.coordinate_frame,
+        "sensor_pose": {
+            "height_m": float(scene.sensor_height_m),
+            "azimuth_tilt_deg": float(scene.azimuth_tilt_deg),
+            "elevation_tilt_deg": float(scene.elevation_tilt_deg),
+        },
+        "camera_projection_hook": {
+            "extrinsics_key": "radar_to_camera",
+            "points_ready": True,
+            "tracks_ready": True,
+            "bboxes_ready": True,
+        },
+    }
+
+
+def _track_is_plausible(track: RadarTrack) -> bool:
+    values = [
+        track.x,
+        track.y,
+        track.z,
+        track.vx,
+        track.vy,
+        track.vz,
+        track.ax,
+        track.ay,
+        track.az,
+        track.confidence,
+    ]
+    if not all(np.isfinite(value) for value in values):
+        return False
+    if track.track_id < 0 or track.track_id > 4096:
+        return False
+    if max(abs(track.x), abs(track.y), abs(track.z)) > 100.0:
+        return False
+    if max(abs(track.vx), abs(track.vy), abs(track.vz)) > 50.0:
+        return False
+    if max(abs(track.ax), abs(track.ay), abs(track.az)) > 100.0:
+        return False
+    if abs(track.confidence) > 10.0:
+        return False
+    return True
+
+
+def _parse_target_list_payload(payload: bytes) -> Optional[List[RadarTrack]]:
+    candidates: List[Tuple[struct.Struct, str]] = [
+        (_TRACK_RECORD_SHORT_STRUCT, "short"),
+        (_TRACK_RECORD_LONG_STRUCT, "legacy"),
+    ]
+
+    for record_struct, record_format in candidates:
+        if len(payload) == 0 or len(payload) % record_struct.size != 0:
+            continue
+
+        tracks: List[RadarTrack] = []
+        valid = True
+        for offset in range(0, len(payload), record_struct.size):
+            values = record_struct.unpack_from(payload, offset)
+            track_id = int(values[0])
+            floats = [float(value) for value in values[1:]]
+
+            if record_format == "short":
+                track = RadarTrack(
+                    track_id=track_id,
+                    x=floats[0],
+                    y=floats[1],
+                    z=floats[2],
+                    vx=floats[3],
+                    vy=floats[4],
+                    vz=floats[5],
+                    ax=floats[6],
+                    ay=floats[7],
+                    az=floats[8],
+                    state=int(round(floats[9])),
+                    confidence=floats[10],
+                    extra_values=floats[11:],
+                    raw_format=record_format,
+                )
+            else:
+                track = RadarTrack(
+                    track_id=track_id,
+                    x=floats[0],
+                    y=floats[1],
+                    z=floats[6],
+                    vx=floats[2],
+                    vy=floats[3],
+                    vz=floats[7],
+                    ax=floats[4],
+                    ay=floats[5],
+                    az=floats[8],
+                    state=0,
+                    confidence=max(0.0, floats[-1]),
+                    extra_values=floats[9:],
+                    raw_format=record_format,
+                )
+            if not _track_is_plausible(track):
+                valid = False
+                break
+            tracks.append(track)
+
+        if valid:
+            return tracks
+    return None
+
+
+def _parse_height_payload(payload: bytes) -> Optional[Dict[int, Tuple[float, float]]]:
+    if len(payload) == 0 or len(payload) % _TRACK_HEIGHT_STRUCT.size != 0:
+        return None
+    heights: Dict[int, Tuple[float, float]] = {}
+    for offset in range(0, len(payload), _TRACK_HEIGHT_STRUCT.size):
+        track_id, z_max, z_min = _TRACK_HEIGHT_STRUCT.unpack_from(payload, offset)
+        if (
+            track_id > 4096
+            or not (np.isfinite(z_max) and np.isfinite(z_min))
+            or abs(z_max) > 50.0
+            or abs(z_min) > 50.0
+        ):
+            return None
+        heights[int(track_id)] = (float(z_min), float(z_max))
+    return heights
+
+
+def _parse_target_index_payload(payload: bytes) -> Optional[List[int]]:
+    if not payload:
+        return []
+    indexes = [int(value) for value in payload]
+    if any(value < 0 or value > 255 for value in indexes):
+        return None
+    return indexes
+
+
+def _build_track_bbox(
+    track: RadarTrack,
+    *,
+    associated_points: Sequence[RadarPoint],
+    height_range: Optional[Tuple[float, float]],
+) -> Tuple[Optional[RadarBox3D], str]:
+    x_center = float(track.x)
+    y_center = float(track.y)
+    z_center = float(track.z)
+
+    if height_range is not None:
+        z_min, z_max = float(height_range[0]), float(height_range[1])
+    else:
+        z_min = z_center - 0.9
+        z_max = z_center + 0.9
+
+    if associated_points:
+        xs = [point.x for point in associated_points]
+        ys = [point.y for point in associated_points]
+        if height_range is None:
+            zs = [point.z for point in associated_points]
+            z_min = min(zs) if zs else z_min
+            z_max = max(zs) if zs else z_max
+        x_min = min(xs)
+        x_max = max(xs)
+        y_min = min(ys)
+        y_max = max(ys)
+        x_padding = max(0.18, (x_max - x_min) * 0.18)
+        y_padding = max(0.18, (y_max - y_min) * 0.18)
+        return (
+            RadarBox3D(
+                x_min=float(x_min - x_padding),
+                x_max=float(x_max + x_padding),
+                y_min=float(y_min - y_padding),
+                y_max=float(y_max + y_padding),
+                z_min=float(z_min),
+                z_max=float(z_max),
+                label=f"ID {track.track_id}",
+                kind="track",
+                track_id=track.track_id,
+            ),
+            "associated_points",
+        )
+
+    half_width = 0.32
+    half_depth = 0.32
+    return (
+        RadarBox3D(
+            x_min=float(x_center - half_width),
+            x_max=float(x_center + half_width),
+            y_min=float(y_center - half_depth),
+            y_max=float(y_center + half_depth),
+            z_min=float(z_min),
+            z_max=float(z_max),
+            label=f"ID {track.track_id}",
+            kind="track",
+            track_id=track.track_id,
+        ),
+        "default_person_extent",
+    )
+
+
+def finalize_tracks(
+    tracks: Sequence[RadarTrack],
+    *,
+    points_for_indexing: Sequence[RadarPoint],
+    track_indexes: Sequence[int],
+    heights_by_track: Optional[Dict[int, Tuple[float, float]]] = None,
+) -> List[RadarTrack]:
+    heights_by_track = heights_by_track or {}
+    point_indexes_by_track: Dict[int, List[int]] = defaultdict(list)
+    for point_index, track_id in enumerate(track_indexes):
+        if track_id >= 250:
+            continue
+        point_indexes_by_track[int(track_id)].append(point_index)
+
+    finalized: List[RadarTrack] = []
+    for track in tracks:
+        cloned = copy.deepcopy(track)
+        associated_indexes = point_indexes_by_track.get(cloned.track_id, [])
+        cloned.associated_point_indexes = list(associated_indexes)
+        cloned.height_range = heights_by_track.get(cloned.track_id)
+
+        associated_points = [
+            points_for_indexing[index]
+            for index in associated_indexes
+            if 0 <= index < len(points_for_indexing)
+        ]
+        bbox, bbox_source = _build_track_bbox(
+            cloned,
+            associated_points=associated_points,
+            height_range=cloned.height_range,
+        )
+        cloned.bbox = bbox
+        cloned.bbox_source = bbox_source
+        finalized.append(cloned)
+    return finalized
+
+
+def parse_replay_tracks(
+    frame_data: Dict[str, Any],
+    *,
+    previous_points: Sequence[RadarPoint],
+) -> Tuple[List[RadarTrack], List[int], Optional[int]]:
+    raw_track_rows = frame_data.get("trackData", [])
+    raw_height_rows = frame_data.get("heightData", [])
+    track_indexes = [
+        int(value)
+        for value in frame_data.get("trackIndexes", [])
+        if isinstance(value, (int, float))
+    ]
+
+    heights_by_track: Dict[int, Tuple[float, float]] = {}
+    for row in raw_height_rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
+            continue
+        track_id = int(row[0])
+        z_max = float(row[1])
+        z_min = float(row[2])
+        heights_by_track[track_id] = (z_min, z_max)
+
+    tracks: List[RadarTrack] = []
+    for row in raw_track_rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 12:
+            continue
+        floats = [float(value) for value in row]
+        track = RadarTrack(
+            track_id=int(round(floats[0])),
+            x=floats[1],
+            y=floats[2],
+            z=floats[3],
+            vx=floats[4],
+            vy=floats[5],
+            vz=floats[6],
+            ax=floats[7],
+            ay=floats[8],
+            az=floats[9],
+            state=int(round(floats[10])),
+            confidence=floats[11],
+            extra_values=floats[12:],
+            raw_format="replay",
+        )
+        if _track_is_plausible(track):
+            tracks.append(track)
+
+    finalized = finalize_tracks(
+        tracks,
+        points_for_indexing=previous_points,
+        track_indexes=track_indexes,
+        heights_by_track=heights_by_track,
+    )
+    presence = None
+    raw_presence = frame_data.get("presence")
+    if isinstance(raw_presence, (int, float)):
+        presence = int(raw_presence)
+    return finalized, track_indexes, presence
+
+
 def load_replay_capture(path: Union[str, Path]) -> ReplayCapture:
     """Load a TI Industrial Visualizer replay JSON into normalized frames."""
 
     replay_path = Path(path)
     payload = json.loads(replay_path.read_text(encoding="utf-8"))
     entries = payload.get("data", [])
+    cfg_lines = [str(line).rstrip("\n") for line in payload.get("cfg", [])]
+    scene = scene_metadata_from_cfg_lines(cfg_lines, config_source=str(replay_path))
 
     frames: List[RadarFrame] = []
     schedule_s: List[float] = []
+    previous_points: List[RadarPoint] = []
 
     if entries:
         base_timestamp = float(entries[0].get("timestamp", 0.0))
@@ -560,6 +1110,10 @@ def load_replay_capture(path: Union[str, Path]) -> ReplayCapture:
                 )
             )
 
+        tracks, track_indexes, presence = parse_replay_tracks(
+            frame_data,
+            previous_points=previous_points,
+        )
         source_timestamp = float(entry.get("timestamp", base_timestamp)) / 1000.0
         relative_schedule = max(0.0, (float(entry.get("timestamp", base_timestamp)) - base_timestamp) / 1000.0)
         schedule_s.append(relative_schedule)
@@ -572,10 +1126,16 @@ def load_replay_capture(path: Union[str, Path]) -> ReplayCapture:
                 points=points,
                 timestamp=relative_schedule,
                 source_timestamp=source_timestamp,
+                tracks=tracks,
+                track_indexes=list(track_indexes),
+                presence=presence,
+                coordinate_frame=scene.coordinate_frame,
+                scene=copy.deepcopy(scene),
+                calibration=_calibration_from_scene(scene),
             )
         )
+        previous_points = list(points)
 
-    cfg_lines = [str(line).rstrip("\n") for line in payload.get("cfg", [])]
     return ReplayCapture(
         path=str(replay_path),
         cfg_lines=cfg_lines,
@@ -583,6 +1143,7 @@ def load_replay_capture(path: Union[str, Path]) -> ReplayCapture:
         device=str(payload.get("device", "")),
         frames=frames,
         schedule_s=schedule_s,
+        scene=scene,
     )
 
 
@@ -633,6 +1194,8 @@ class IWR6843Driver(FrameSource):
         self._cli_log_text = ""
         self._run_dir: Optional[Path] = None
         self._report_path: Optional[Path] = None
+        self._scene_metadata = RadarSceneMetadata(config_source=config_path)
+        self._previous_points_for_indexes: List[RadarPoint] = []
 
         self._probe_failed_stage = ""
         self._probe_log_tail = ""
@@ -673,6 +1236,10 @@ class IWR6843Driver(FrameSource):
             rx_bytes=self._rx_bytes,
             magic_hits=self._magic_hits,
             frames=self._frame_count,
+            tracks=len(latest_frame.tracks) if latest_frame is not None else 0,
+            presence=""
+            if latest_frame is None or latest_frame.presence is None
+            else str(latest_frame.presence),
             fps=self.points_per_second,
             last_packet_size=self._last_packet_size,
             last_parse_error=self._last_parse_error,
@@ -736,6 +1303,8 @@ class IWR6843Driver(FrameSource):
             self._cleanup_serial()
             self._persist_session_artifacts()
             return False
+
+        self._scene_metadata = scene_metadata_from_cfg_path(self._config_path)
 
         try:
             self._data_serial = open_serial_with_retries(
@@ -823,15 +1392,7 @@ class IWR6843Driver(FrameSource):
             if not self._frame_buffer:
                 return None
             frame = self._frame_buffer[-1]
-            return RadarFrame(
-                frame_number=frame.frame_number,
-                subframe_number=frame.subframe_number,
-                num_detected_obj=frame.num_detected_obj,
-                num_tlvs=frame.num_tlvs,
-                points=list(frame.points),
-                timestamp=frame.timestamp,
-                source_timestamp=frame.source_timestamp,
-            )
+            return clone_radar_frame(frame)
 
     def get_frame_count(self) -> int:
         return self._frame_count
@@ -946,6 +1507,7 @@ class IWR6843Driver(FrameSource):
         self._unknown_tlv_counts = defaultdict(int)
         self._unknown_tlv_lengths = defaultdict(list)
         self._cli_log_text = ""
+        self._previous_points_for_indexes = []
         self._probe_failed_stage = ""
         self._probe_log_tail = ""
 
@@ -1174,6 +1736,7 @@ class IWR6843Driver(FrameSource):
                 time.sleep(0.1)
 
     def _parse_packet(self, packet: bytes) -> Optional[RadarFrame]:
+        parse_error = ""
         try:
             header = _HEADER_STRUCT.unpack_from(packet, 0)
         except struct.error as exc:
@@ -1190,36 +1753,70 @@ class IWR6843Driver(FrameSource):
         subframe_number = int(header[11])
 
         points: List[RadarPoint] = []
+        tracks: List[RadarTrack] = []
+        heights_by_track: Dict[int, Tuple[float, float]] = {}
+        track_indexes: List[int] = []
+        presence: Optional[int] = None
         offset = HEADER_SIZE
 
         for _ in range(num_tlvs):
             if offset + TLV_HEADER_SIZE > len(packet):
-                self._last_parse_error = "truncated TLV header"
+                parse_error = "truncated TLV header"
                 break
 
             tlv_type, tlv_length = _TLV_STRUCT.unpack_from(packet, offset)
             offset += TLV_HEADER_SIZE
 
             if tlv_length < 0 or offset + tlv_length > len(packet):
-                self._last_parse_error = f"bad TLV len {tlv_length} for type {tlv_type}"
+                parse_error = f"bad TLV len {tlv_length} for type {tlv_type}"
                 break
 
             payload = packet[offset : offset + tlv_length]
             offset += tlv_length
 
             parsed_points = self._parse_tlv_points(tlv_type, payload)
-            if parsed_points:
+            if parsed_points is not None:
                 points = parsed_points
                 continue
 
-            if tlv_type not in (TLV_DETECTED_OBJECTS, TLV_SIDE_INFO):
+            parsed_tracks = self._parse_track_list_tlv(tlv_type, payload)
+            if parsed_tracks is not None:
+                tracks = parsed_tracks
+                continue
+
+            parsed_heights = self._parse_track_height_tlv(tlv_type, payload)
+            if parsed_heights is not None:
+                heights_by_track = parsed_heights
+                continue
+
+            parsed_indexes = self._parse_track_indexes_tlv(
+                tlv_type,
+                payload,
+                point_count=len(self._previous_points_for_indexes),
+            )
+            if parsed_indexes is not None:
+                track_indexes = parsed_indexes
+                continue
+
+            parsed_presence = self._parse_presence_tlv(tlv_type, payload)
+            if parsed_presence is not None:
+                presence = parsed_presence
+                continue
+
+            if tlv_type != TLV_SIDE_INFO:
                 self._unknown_tlv_counts[int(tlv_type)] += 1
                 lengths = self._unknown_tlv_lengths[int(tlv_type)]
                 lengths.append(int(tlv_length))
                 if len(lengths) > 10:
                     del lengths[:-10]
 
-        return RadarFrame(
+        finalized_tracks = finalize_tracks(
+            tracks,
+            points_for_indexing=self._previous_points_for_indexes,
+            track_indexes=track_indexes,
+            heights_by_track=heights_by_track,
+        )
+        frame = RadarFrame(
             frame_number=frame_number,
             subframe_number=subframe_number,
             num_detected_obj=num_detected_obj,
@@ -1227,21 +1824,89 @@ class IWR6843Driver(FrameSource):
             points=points,
             timestamp=time.time(),
             source_timestamp=time.time(),
+            tracks=finalized_tracks,
+            track_indexes=list(track_indexes),
+            presence=presence,
+            coordinate_frame=self._scene_metadata.coordinate_frame,
+            scene=copy.deepcopy(self._scene_metadata),
+            calibration=_calibration_from_scene(self._scene_metadata),
         )
+        self._previous_points_for_indexes = list(points)
+        self._last_parse_error = parse_error
+        return frame
 
     def _parse_tlv_points(
         self,
         tlv_type: int,
         payload: bytes,
-    ) -> List[RadarPoint]:
+    ) -> Optional[List[RadarPoint]]:
         if tlv_type == TLV_DETECTED_OBJECTS and len(payload) % _RAW_POINT_STRUCT.size == 0:
             return self._parse_raw_cartesian_points(payload)
+
+        if tlv_type not in (
+            TLV_COMPRESSED_POINTS,
+            TLV_COMPRESSED_POINTS_LEGACY,
+            TLV_DETECTED_OBJECTS,
+        ) and len(payload) >= _TRACK_RECORD_SHORT_STRUCT.size:
+            return None
 
         compressed = self._parse_compressed_points(payload)
         if compressed is not None:
             return compressed
 
-        return []
+        return None
+
+    def _parse_track_list_tlv(
+        self,
+        tlv_type: int,
+        payload: bytes,
+    ) -> Optional[List[RadarTrack]]:
+        if tlv_type != TLV_TRACK_LIST and len(payload) % _TRACK_RECORD_SHORT_STRUCT.size != 0 and len(payload) % _TRACK_RECORD_LONG_STRUCT.size != 0:
+            return None
+        return _parse_target_list_payload(payload)
+
+    def _parse_track_height_tlv(
+        self,
+        tlv_type: int,
+        payload: bytes,
+    ) -> Optional[Dict[int, Tuple[float, float]]]:
+        if tlv_type != TLV_TRACK_HEIGHT and len(payload) % _TRACK_HEIGHT_STRUCT.size != 0:
+            return None
+        return _parse_height_payload(payload)
+
+    def _parse_track_indexes_tlv(
+        self,
+        tlv_type: int,
+        payload: bytes,
+        *,
+        point_count: int,
+    ) -> Optional[List[int]]:
+        expected_counts = {count for count in (point_count, len(self._previous_points_for_indexes)) if count > 0}
+        if tlv_type != TLV_TRACK_INDEX and (not expected_counts or len(payload) not in expected_counts):
+            return None
+        return _parse_target_index_payload(payload)
+
+    def _parse_presence_tlv(
+        self,
+        tlv_type: int,
+        payload: bytes,
+    ) -> Optional[int]:
+        if len(payload) != 4:
+            return None
+        if tlv_type != TLV_PRESENCE and tlv_type in (
+            TLV_DETECTED_OBJECTS,
+            TLV_SIDE_INFO,
+            TLV_COMPRESSED_POINTS,
+            TLV_COMPRESSED_POINTS_LEGACY,
+            TLV_TRACK_LIST,
+            TLV_TRACK_INDEX,
+            TLV_TRACK_HEIGHT,
+        ):
+            return None
+        value = struct.unpack_from("<I", payload, 0)[0]
+        if tlv_type != TLV_PRESENCE and value > 16:
+            return None
+        return int(value)
 
     def _parse_raw_cartesian_points(self, payload: bytes) -> List[RadarPoint]:
         points: List[RadarPoint] = []
@@ -1368,15 +2033,7 @@ class ReplayRadarSource(FrameSource):
         ):
             self._current_index += 1
         frame = self._capture.frames[max(self._current_index, 0)]
-        return RadarFrame(
-            frame_number=frame.frame_number,
-            subframe_number=frame.subframe_number,
-            num_detected_obj=frame.num_detected_obj,
-            num_tlvs=frame.num_tlvs,
-            points=list(frame.points),
-            timestamp=frame.timestamp,
-            source_timestamp=frame.source_timestamp,
-        )
+        return clone_radar_frame(frame)
 
     def session_state(self) -> RadarSessionState:
         frame = self.latest_frame()
@@ -1407,6 +2064,8 @@ class ReplayRadarSource(FrameSource):
             health_verdict=verdict,
             health_reason=reason,
             frames=frames_seen,
+            tracks=len(frame.tracks) if frame is not None else 0,
+            presence="" if frame is None or frame.presence is None else str(frame.presence),
             fps=self._replay_fps(),
             plots_updating=plots_updating,
             config_ok=True,
@@ -1466,6 +2125,19 @@ class MockRadar(FrameSource):
 
     def latest_frame(self) -> Optional[RadarFrame]:
         points = self.get_point_cloud()
+        target = points[0] if points else RadarPoint(0.0, self.depth_y, self.height_z, 0.0)
+        bbox = RadarBox3D(
+            x_min=target.x - 0.3,
+            x_max=target.x + 0.3,
+            y_min=target.y - 0.3,
+            y_max=target.y + 0.3,
+            z_min=target.z,
+            z_max=target.z + 1.7,
+            label="ID 0",
+            kind="track",
+            track_id=0,
+        )
+        scene = RadarSceneMetadata()
         return RadarFrame(
             frame_number=self._frame_count,
             subframe_number=0,
@@ -1474,6 +2146,19 @@ class MockRadar(FrameSource):
             points=points,
             timestamp=time.time(),
             source_timestamp=time.time(),
+            tracks=[
+                RadarTrack(
+                    track_id=0,
+                    x=target.x,
+                    y=target.y,
+                    z=target.z + 0.85,
+                    bbox=bbox,
+                    bbox_source="mock",
+                )
+            ],
+            coordinate_frame=scene.coordinate_frame,
+            scene=scene,
+            calibration=_calibration_from_scene(scene),
         )
 
     def session_state(self) -> RadarSessionState:
@@ -1496,6 +2181,7 @@ class MockRadar(FrameSource):
             health_verdict=verdict,
             health_reason=reason,
             frames=self._frame_count,
+            tracks=len(latest_frame.tracks) if latest_frame is not None else 0,
             config_ok=True,
             plots_updating=plots_updating,
         )
@@ -1701,6 +2387,34 @@ class CameraProjection:
         for point in points:
             u, v = self.project_3d_to_2d(point.position_3d)
             projected.append((point, u, v))
+        return projected
+
+    def project_box_3d(self, box: Optional[RadarBox3D]) -> Optional[Tuple[int, int, int, int]]:
+        if box is None:
+            return None
+        projected = [
+            self.project_3d_to_2d(corner)
+            for corner in box.corners()
+        ]
+        valid = [(u, v) for u, v in projected if u >= 0 and v >= 0]
+        if not valid:
+            return None
+        us = [u for u, _ in valid]
+        vs = [v for _, v in valid]
+        return (min(us), min(vs), max(us), max(vs))
+
+    def project_tracks(self, tracks: List[RadarTrack]) -> List[Dict[str, Any]]:
+        projected: List[Dict[str, Any]] = []
+        for track in tracks:
+            projected.append(
+                {
+                    "track_id": int(track.track_id),
+                    "center_uv": list(self.project_3d_to_2d(track.position_3d)),
+                    "bbox_uv": None
+                    if track.bbox is None
+                    else list(self.project_box_3d(track.bbox) or ()),
+                }
+            )
         return projected
 
     def _rebuild(self) -> None:

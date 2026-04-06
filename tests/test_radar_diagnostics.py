@@ -39,6 +39,42 @@ def build_packet(tlvs, frame_number=1, num_detected_obj=0, subframe_number=0):
     return header + bytes(payload)
 
 
+def build_short_track_record(
+    track_id,
+    *,
+    x,
+    y,
+    z,
+    vx=0.0,
+    vy=0.0,
+    vz=0.0,
+    ax=0.0,
+    ay=0.0,
+    az=0.0,
+    state=3.0,
+    confidence=0.99,
+    extras=(0.0, 0.0, 0.0, 0.0),
+):
+    return radar._TRACK_RECORD_SHORT_STRUCT.pack(
+        int(track_id),
+        float(x),
+        float(y),
+        float(z),
+        float(vx),
+        float(vy),
+        float(vz),
+        float(ax),
+        float(ay),
+        float(az),
+        float(state),
+        float(confidence),
+        float(extras[0]),
+        float(extras[1]),
+        float(extras[2]),
+        float(extras[3]),
+    )
+
+
 class ReplayLoadingTests(unittest.TestCase):
     def test_load_replay_capture_normalizes_frames(self):
         capture = radar.load_replay_capture(ROOT / "04_01_2026_16_12_52" / "replay_8.json")
@@ -53,6 +89,19 @@ class ReplayLoadingTests(unittest.TestCase):
         self.assertEqual(first_frame.frame_number, 701)
         self.assertEqual(first_frame.num_detected_obj, 86)
         self.assertEqual(len(first_frame.points), 86)
+        self.assertEqual(len(first_frame.tracks), 2)
+        self.assertTrue(all(track.bbox is not None for track in first_frame.tracks))
+        self.assertEqual(capture.scene.sensor_height_m, 2.0)
+        self.assertEqual(len(capture.scene.boundary_boxes), 1)
+        self.assertEqual(len(capture.scene.presence_boxes), 1)
+
+    def test_fusion_ready_payload_contains_tracks_and_scene(self):
+        capture = radar.load_replay_capture(ROOT / "04_01_2026_16_12_52" / "replay_8.json")
+        payload = capture.frames[1].fusion_ready_payload()
+        self.assertEqual(payload["frame_number"], 702)
+        self.assertEqual(payload["coordinate_frame"], "radar_sensor_xyz")
+        self.assertEqual(len(payload["tracks"]), 2)
+        self.assertIn("sensor_pose", payload["calibration"])
 
 
 class PacketParsingTests(unittest.TestCase):
@@ -108,6 +157,64 @@ class PacketParsingTests(unittest.TestCase):
         state = driver.session_state()
         self.assertEqual(state.unknown_tlv_counts.get(999), 1)
         self.assertEqual(state.unknown_tlv_lengths.get(999), [5])
+
+    def test_parse_tracks_heights_indexes_and_presence(self):
+        driver = radar.IWR6843Driver()
+
+        units = struct.pack("<5f", 0.01, 0.01, 0.25, 0.1, 0.5)
+        points = struct.pack("<bbHhH", 4, 2, 8, 0, 5) + struct.pack("<bbHhH", 5, 3, 9, 0, 6)
+        packet_one = build_packet(
+            [(radar.TLV_COMPRESSED_POINTS_LEGACY, units + points)],
+            frame_number=1,
+            num_detected_obj=2,
+        )
+        first_frame = driver.parse_packet_bytes(packet_one)
+        self.assertIsNotNone(first_frame)
+
+        track_payload = build_short_track_record(
+            7,
+            x=0.18,
+            y=2.1,
+            z=1.0,
+            vx=0.05,
+            confidence=0.98,
+        )
+        height_payload = radar._TRACK_HEIGHT_STRUCT.pack(7, 1.82, 0.12)
+        index_payload = bytes([7, 7])
+        presence_payload = struct.pack("<I", 1)
+        packet_two = build_packet(
+            [
+                (radar.TLV_TRACK_LIST, track_payload),
+                (radar.TLV_TRACK_HEIGHT, height_payload),
+                (radar.TLV_TRACK_INDEX, index_payload),
+                (radar.TLV_PRESENCE, presence_payload),
+            ],
+            frame_number=2,
+            num_detected_obj=0,
+        )
+
+        frame = driver.parse_packet_bytes(packet_two)
+        self.assertIsNotNone(frame)
+        assert frame is not None
+        self.assertEqual(len(frame.tracks), 1)
+        self.assertEqual(frame.tracks[0].track_id, 7)
+        self.assertEqual(frame.presence, 1)
+        self.assertEqual(frame.track_indexes, [7, 7])
+        self.assertIsNotNone(frame.tracks[0].bbox)
+        assert frame.tracks[0].bbox is not None
+        self.assertAlmostEqual(frame.tracks[0].bbox.z_min, 0.12, places=4)
+        self.assertAlmostEqual(frame.tracks[0].bbox.z_max, 1.82, places=4)
+        self.assertEqual(frame.tracks[0].bbox_source, "associated_points")
+        self.assertEqual(frame.calibration["camera_projection_hook"]["tracks_ready"], True)
+
+    def test_project_box_to_camera(self):
+        capture = radar.load_replay_capture(ROOT / "04_01_2026_16_12_52" / "replay_8.json")
+        frame = capture.frames[1]
+        camera = radar.CameraProjection()
+        projection = frame.project_to_camera(camera)
+        self.assertEqual(len(projection["tracks"]), len(frame.tracks))
+        self.assertEqual(len(projection["points"]), len(frame.points))
+        self.assertIsNotNone(projection["tracks"][0]["uv_bbox"])
 
 
 class HealthVerdictTests(unittest.TestCase):
