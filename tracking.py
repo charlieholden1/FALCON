@@ -114,14 +114,6 @@ class PersonTracker:
     using_radar: bool = False                         # True when position driven by radar
     radar_frames_matched: int = 0                     # consecutive frames with radar match
     last_radar_match_frame: int = 0                   # frame counter at last radar match
-    radar_track_id: Optional[int] = None               # linked TI radar track ID
-    fusion_mode: str = "CAMERA_LOCKED"                # high-level handoff state
-    handoff_age_frames: int = 0                       # frames spent in radar handoff
-    recapture_confirm_frames: int = 0                 # stable camera frames after radar-only
-    synthetic_pose: Optional[np.ndarray] = None        # radar-only generated COCO-17 pose
-    last_real_keypoints: Optional[np.ndarray] = None   # latest camera-owned pose
-    last_real_bbox: Optional[np.ndarray] = None        # latest camera-owned bbox
-    last_fusion_event: str = ""
 
     # ── helpers ──────────────────────────────────────────────────────
 
@@ -530,10 +522,6 @@ class TrackingManager:
 
         # Update relative skeleton offsets
         track.update_relative_skeleton()
-        if track.keypoints is not None:
-            track.last_real_keypoints = track.keypoints.copy()
-            track.last_real_bbox = track.bbox.copy()
-            track.synthetic_pose = None
 
         # Store depth reading
         track.z_depth_meters = depth
@@ -576,9 +564,6 @@ class TrackingManager:
             z_depth_meters=depth,
         )
         track.last_bbox_size = track.bbox_wh.copy()
-        if track.keypoints is not None:
-            track.last_real_keypoints = track.keypoints.copy()
-            track.last_real_bbox = track.bbox.copy()
         self._next_id += 1
 
         # Cache relative skeleton
