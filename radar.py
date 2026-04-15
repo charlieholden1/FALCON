@@ -72,6 +72,30 @@ TLV_TRACK_INDEX = 8
 TLV_TRACK_HEIGHT = 9
 TLV_PRESENCE = 10
 TLV_COMPRESSED_POINTS_LEGACY = 301
+TLV_3D_PEOPLE_TRACK_LIST = 1010
+TLV_3D_PEOPLE_TRACK_INDEX = 1011
+TLV_3D_PEOPLE_TRACK_HEIGHT = 1012
+TLV_3D_PEOPLE_COMPRESSED_POINTS = 1020
+TLV_3D_PEOPLE_PRESENCE = 1021
+TLV_COMPRESSED_POINT_TYPES = {
+    TLV_COMPRESSED_POINTS,
+    TLV_COMPRESSED_POINTS_LEGACY,
+    TLV_3D_PEOPLE_COMPRESSED_POINTS,
+}
+TLV_TRACK_LIST_TYPES = {TLV_TRACK_LIST, TLV_3D_PEOPLE_TRACK_LIST}
+TLV_TRACK_INDEX_TYPES = {TLV_TRACK_INDEX, TLV_3D_PEOPLE_TRACK_INDEX}
+TLV_TRACK_HEIGHT_TYPES = {TLV_TRACK_HEIGHT, TLV_3D_PEOPLE_TRACK_HEIGHT}
+TLV_PRESENCE_TYPES = {TLV_PRESENCE, TLV_3D_PEOPLE_PRESENCE}
+TLV_SIDE_INFO_TYPES = {TLV_SIDE_INFO}
+KNOWN_TLV_TYPES = (
+    {TLV_DETECTED_OBJECTS}
+    | TLV_COMPRESSED_POINT_TYPES
+    | TLV_TRACK_LIST_TYPES
+    | TLV_TRACK_INDEX_TYPES
+    | TLV_TRACK_HEIGHT_TYPES
+    | TLV_PRESENCE_TYPES
+    | TLV_SIDE_INFO_TYPES
+)
 
 HEALTH_HEALTHY = "Healthy"
 HEALTH_CONFIG_FAILED = "Config Failed"
@@ -97,6 +121,15 @@ _SERIAL_OPEN_DELAY_S = 0.5
 _CLI_WAKE_ATTEMPTS = 3
 _CLI_WAKE_TIMEOUT_S = 0.8
 _CLI_POST_OPEN_SETTLE_S = 1.0
+PERSON_BOX_DEFAULT_WIDTH_M = 0.70
+PERSON_BOX_DEFAULT_DEPTH_M = 0.70
+PERSON_BOX_DEFAULT_HEIGHT_M = 1.80
+PERSON_BOX_MIN_WIDTH_M = 0.45
+PERSON_BOX_MIN_DEPTH_M = 0.45
+PERSON_BOX_MIN_HEIGHT_M = 1.20
+PERSON_BOX_MAX_WIDTH_M = 1.15
+PERSON_BOX_MAX_DEPTH_M = 1.15
+PERSON_BOX_MAX_HEIGHT_M = 2.30
 
 
 @dataclass
@@ -347,6 +380,8 @@ class RadarSessionState:
     probe_log_tail: str = ""
     run_dir: str = ""
     report_path: str = ""
+    frame_debug_path: str = ""
+    tracking_debug: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -431,6 +466,209 @@ def clone_radar_frame(frame: Optional[RadarFrame]) -> Optional[RadarFrame]:
     if frame is None:
         return None
     return copy.deepcopy(frame)
+
+
+def _numeric_stats(values: Sequence[float]) -> Dict[str, Optional[float]]:
+    if not values:
+        return {"min": None, "max": None, "mean": None}
+    arr = np.asarray(values, dtype=np.float64)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return {"min": None, "max": None, "mean": None}
+    return {
+        "min": float(finite.min()),
+        "max": float(finite.max()),
+        "mean": float(finite.mean()),
+    }
+
+
+def radar_frame_debug_payload(
+    frame: RadarFrame,
+    *,
+    include_points: bool = True,
+    max_points: int = 256,
+) -> Dict[str, Any]:
+    """Compact per-frame snapshot for tuning live people-tracking stability."""
+
+    track_index_counts: Dict[str, int] = defaultdict(int)
+    for value in frame.track_indexes:
+        key = "unassigned" if int(value) >= 250 else str(int(value))
+        track_index_counts[key] += 1
+
+    point_payload = []
+    if include_points:
+        for point in frame.points[: max(0, int(max_points))]:
+            point_payload.append(
+                {
+                    "x": float(point.x),
+                    "y": float(point.y),
+                    "z": float(point.z),
+                    "velocity": float(point.velocity),
+                    "snr": float(point.snr),
+                }
+            )
+
+    tracks = []
+    for track in frame.tracks:
+        bbox = None
+        if track.bbox is not None:
+            bbox = {
+                "x_min": float(track.bbox.x_min),
+                "x_max": float(track.bbox.x_max),
+                "y_min": float(track.bbox.y_min),
+                "y_max": float(track.bbox.y_max),
+                "z_min": float(track.bbox.z_min),
+                "z_max": float(track.bbox.z_max),
+                "width": float(track.bbox.width),
+                "depth": float(track.bbox.depth),
+                "height": float(track.bbox.height),
+            }
+        tracks.append(
+            {
+                "track_id": int(track.track_id),
+                "position": [float(track.x), float(track.y), float(track.z)],
+                "velocity": [float(track.vx), float(track.vy), float(track.vz)],
+                "speed": float(track.speed),
+                "confidence": float(track.confidence),
+                "state": int(track.state),
+                "associated_point_count": len(track.associated_point_indexes),
+                "associated_point_indexes": list(track.associated_point_indexes[:64]),
+                "bbox_source": track.bbox_source,
+                "bbox": bbox,
+                "raw_format": track.raw_format,
+            }
+        )
+
+    return {
+        "frame_number": int(frame.frame_number),
+        "subframe_number": int(frame.subframe_number),
+        "timestamp": float(frame.timestamp),
+        "source_timestamp": float(frame.source_timestamp),
+        "num_detected_obj": int(frame.num_detected_obj),
+        "num_tlvs": int(frame.num_tlvs),
+        "point_count": len(frame.points),
+        "track_count": len(frame.tracks),
+        "presence": None if frame.presence is None else int(frame.presence),
+        "track_indexes_count": len(frame.track_indexes),
+        "track_index_counts": dict(sorted(track_index_counts.items())),
+        "point_stats": {
+            "x": _numeric_stats([point.x for point in frame.points]),
+            "y": _numeric_stats([point.y for point in frame.points]),
+            "z": _numeric_stats([point.z for point in frame.points]),
+            "velocity": _numeric_stats([point.velocity for point in frame.points]),
+            "snr": _numeric_stats([point.snr for point in frame.points]),
+        },
+        "points_truncated": len(frame.points) > len(point_payload),
+        "points": point_payload,
+        "tracks": tracks,
+    }
+
+
+class TrackingStabilityMonitor:
+    """Accumulates live-run stability stats without touching the render loop."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.total_frames = 0
+        self.frames_with_points = 0
+        self.frames_with_tracks = 0
+        self.frames_with_presence = 0
+        self.frames_presence_without_tracks = 0
+        self.frames_points_without_tracks = 0
+        self.current_no_track_streak = 0
+        self.max_no_track_streak = 0
+        self.single_track_id_switches = 0
+        self.track_gap_events = 0
+        self.track_gap_frames = 0
+        self._last_single_track_id: Optional[int] = None
+        self._last_active_ids: List[int] = []
+        self._point_counts: deque[int] = deque(maxlen=240)
+        self._track_first_frame: Dict[int, int] = {}
+        self._track_last_frame: Dict[int, int] = {}
+        self._track_seen_frames: Dict[int, int] = defaultdict(int)
+
+    def update(self, frame: RadarFrame) -> None:
+        self.total_frames += 1
+        point_count = len(frame.points)
+        track_ids = sorted(int(track.track_id) for track in frame.tracks)
+        presence_active = frame.presence not in (None, 0)
+
+        self._point_counts.append(point_count)
+        if point_count > 0:
+            self.frames_with_points += 1
+        if presence_active:
+            self.frames_with_presence += 1
+        if track_ids:
+            self.frames_with_tracks += 1
+            self.current_no_track_streak = 0
+        else:
+            self.current_no_track_streak += 1
+            self.max_no_track_streak = max(self.max_no_track_streak, self.current_no_track_streak)
+        if presence_active and not track_ids:
+            self.frames_presence_without_tracks += 1
+        if point_count > 0 and not track_ids:
+            self.frames_points_without_tracks += 1
+
+        frame_number = int(frame.frame_number)
+        for track_id in track_ids:
+            if track_id not in self._track_first_frame:
+                self._track_first_frame[track_id] = frame_number
+            last_frame = self._track_last_frame.get(track_id)
+            if last_frame is not None and frame_number > last_frame + 1:
+                self.track_gap_events += 1
+                self.track_gap_frames += frame_number - last_frame - 1
+            self._track_last_frame[track_id] = frame_number
+            self._track_seen_frames[track_id] += 1
+
+        if len(track_ids) == 1:
+            track_id = track_ids[0]
+            if self._last_single_track_id is not None and self._last_single_track_id != track_id:
+                self.single_track_id_switches += 1
+            self._last_single_track_id = track_id
+        elif len(track_ids) > 1:
+            self._last_single_track_id = None
+        self._last_active_ids = track_ids
+
+    def to_dict(self) -> Dict[str, Any]:
+        point_counts = list(self._point_counts)
+        total = max(self.total_frames, 1)
+        frames_with_presence = max(self.frames_with_presence, 1)
+        tracks: Dict[str, Dict[str, int]] = {}
+        for track_id in sorted(self._track_seen_frames):
+            tracks[str(track_id)] = {
+                "first_frame": int(self._track_first_frame.get(track_id, 0)),
+                "last_frame": int(self._track_last_frame.get(track_id, 0)),
+                "seen_frames": int(self._track_seen_frames.get(track_id, 0)),
+            }
+
+        return {
+            "total_frames": int(self.total_frames),
+            "frames_with_points": int(self.frames_with_points),
+            "frames_with_tracks": int(self.frames_with_tracks),
+            "frames_with_presence": int(self.frames_with_presence),
+            "frames_presence_without_tracks": int(self.frames_presence_without_tracks),
+            "frames_points_without_tracks": int(self.frames_points_without_tracks),
+            "track_coverage_pct": round(100.0 * self.frames_with_tracks / total, 2),
+            "presence_track_agreement_pct": round(
+                100.0 * (self.frames_with_presence - self.frames_presence_without_tracks) / frames_with_presence,
+                2,
+            ),
+            "current_no_track_streak": int(self.current_no_track_streak),
+            "max_no_track_streak": int(self.max_no_track_streak),
+            "active_track_ids": list(self._last_active_ids),
+            "unique_track_ids": sorted(int(track_id) for track_id in self._track_seen_frames),
+            "single_track_id_switches": int(self.single_track_id_switches),
+            "track_gap_events": int(self.track_gap_events),
+            "track_gap_frames": int(self.track_gap_frames),
+            "recent_point_count": {
+                "min": min(point_counts) if point_counts else 0,
+                "max": max(point_counts) if point_counts else 0,
+                "mean": round(float(sum(point_counts) / len(point_counts)), 2) if point_counts else 0.0,
+            },
+            "tracks": tracks,
+        }
 
 
 def scene_metadata_from_cfg_lines(
@@ -558,6 +796,13 @@ def _extract_hwid_value(hwid: str, key: str) -> str:
     return match.group(1) if match else ""
 
 
+def _location_interface_number(hwid: str) -> str:
+    location = _extract_hwid_value(hwid, "LOCATION")
+    if not location:
+        return ""
+    return location.rsplit(":", 1)[-1].lower()
+
+
 def _serial_group_key(info: SerialPortInfo) -> str:
     hwid = info.hwid or ""
     serial_id = _extract_hwid_value(hwid, "SER")
@@ -601,6 +846,11 @@ def _serial_role_hint(info: SerialPortInfo) -> str:
         return "config"
     if "if03" in text:
         return "data"
+    location_interface = _location_interface_number(info.hwid)
+    if ("xds110" in text or "0451:bef3" in text) and location_interface == "1.0":
+        return "config"
+    if ("xds110" in text or "0451:bef3" in text) and location_interface == "1.3":
+        return "data"
     # On this project's CP2105-based adapter, the Enhanced interface is the
     # command CLI and the Standard interface is the high-rate data stream.
     if "enhanced com port" in text:
@@ -608,7 +858,7 @@ def _serial_role_hint(info: SerialPortInfo) -> str:
     if "standard com port" in text:
         return "data"
     if "application/user uart" in text:
-        return "data"
+        return "config"
     if "aux data port" in text:
         return "data"
     return "unknown"
@@ -751,10 +1001,15 @@ def evaluate_health_verdict(
     if not config_ok:
         return HEALTH_NO_DATA, "Waiting to start the sensor."
 
-    if magic_hits > 0 and frames >= 3 and plots_updating:
+    if magic_hits > 0 and frames >= 3:
+        if plots_updating:
+            return (
+                HEALTH_HEALTHY,
+                "Config succeeded, frames are parsing, and the live plots are updating.",
+            )
         return (
             HEALTH_HEALTHY,
-            "Config succeeded, frames are parsing, and the live plots are updating.",
+            "Config succeeded and frames are parsing. GUI plot rendering has not reported in this session.",
         )
 
     if (rx_bytes > 0 or magic_hits > 0) and (frames == 0 or bool(last_parse_error)):
@@ -771,7 +1026,10 @@ def evaluate_health_verdict(
         if frames < 3:
             return HEALTH_NO_DATA, "Waiting for at least 3 parsed frames within the startup window."
         if not plots_updating:
-            return HEALTH_NO_DATA, "Frames are parsing; waiting for the plots to update."
+            return (
+                HEALTH_HEALTHY,
+                "Frames are parsing during the startup window; GUI plot rendering has not reported yet.",
+            )
 
     if rx_bytes == 0:
         return HEALTH_NO_DATA, "Config succeeded, but no data bytes arrived within 5 seconds."
@@ -780,7 +1038,10 @@ def evaluate_health_verdict(
         return HEALTH_NO_DATA, "Frames are arriving, but the viability threshold has not been met yet."
 
     if not plots_updating:
-        return HEALTH_NO_DATA, "Frames parsed, but the plots are not updating yet."
+        return (
+            HEALTH_HEALTHY,
+            "Frames parsed successfully; GUI plot rendering has not reported yet.",
+        )
 
     return HEALTH_NO_DATA, "Config succeeded, but the logging stream is still inconclusive."
 
@@ -917,6 +1178,68 @@ def _parse_target_index_payload(payload: bytes) -> Optional[List[int]]:
     return indexes
 
 
+def _clamped_extent_from_points(
+    values: Sequence[float],
+    center: float,
+    *,
+    min_size: float,
+    max_size: float,
+) -> Tuple[float, float]:
+    """Build a stable human-scale extent from noisy associated radar points."""
+
+    if values:
+        arr = np.asarray(values, dtype=np.float64)
+        finite = arr[np.isfinite(arr)]
+    else:
+        finite = np.asarray([], dtype=np.float64)
+
+    if finite.size >= 3:
+        low, high = np.percentile(finite, [10.0, 90.0])
+    elif finite.size:
+        low = float(finite.min())
+        high = float(finite.max())
+    else:
+        low = high = float(center)
+
+    raw_size = max(float(high - low), float(min_size))
+    size = min(max(raw_size, float(min_size)), float(max_size))
+    midpoint = float((low + high) * 0.5) if finite.size else float(center)
+    # Keep the visual box anchored to the tracker state; associated points can
+    # be sparse or include clutter, especially with two people close together.
+    midpoint = float((midpoint * 0.35) + (float(center) * 0.65))
+    return midpoint - size * 0.5, midpoint + size * 0.5
+
+
+def _clamp_height_range(
+    z_center: float,
+    height_range: Optional[Tuple[float, float]],
+    associated_points: Sequence[RadarPoint],
+) -> Tuple[float, float]:
+    if height_range is not None:
+        z_min, z_max = float(height_range[0]), float(height_range[1])
+    elif associated_points:
+        zs = np.asarray([point.z for point in associated_points], dtype=np.float64)
+        finite = zs[np.isfinite(zs)]
+        if finite.size >= 3:
+            z_min, z_max = np.percentile(finite, [5.0, 95.0])
+        elif finite.size:
+            z_min = float(finite.min())
+            z_max = float(finite.max())
+        else:
+            z_min = float(z_center) - PERSON_BOX_DEFAULT_HEIGHT_M * 0.5
+            z_max = float(z_center) + PERSON_BOX_DEFAULT_HEIGHT_M * 0.5
+    else:
+        z_min = float(z_center) - PERSON_BOX_DEFAULT_HEIGHT_M * 0.5
+        z_max = float(z_center) + PERSON_BOX_DEFAULT_HEIGHT_M * 0.5
+
+    height = max(float(z_max - z_min), PERSON_BOX_MIN_HEIGHT_M)
+    height = min(height, PERSON_BOX_MAX_HEIGHT_M)
+    midpoint = float((z_min + z_max) * 0.5)
+    if not np.isfinite(midpoint):
+        midpoint = float(z_center)
+    return midpoint - height * 0.5, midpoint + height * 0.5
+
+
 def _build_track_bbox(
     track: RadarTrack,
     *,
@@ -927,42 +1250,40 @@ def _build_track_bbox(
     y_center = float(track.y)
     z_center = float(track.z)
 
-    if height_range is not None:
-        z_min, z_max = float(height_range[0]), float(height_range[1])
-    else:
-        z_min = z_center - 0.9
-        z_max = z_center + 0.9
+    z_min, z_max = _clamp_height_range(z_center, height_range, associated_points)
 
     if associated_points:
         xs = [point.x for point in associated_points]
         ys = [point.y for point in associated_points]
-        if height_range is None:
-            zs = [point.z for point in associated_points]
-            z_min = min(zs) if zs else z_min
-            z_max = max(zs) if zs else z_max
-        x_min = min(xs)
-        x_max = max(xs)
-        y_min = min(ys)
-        y_max = max(ys)
-        x_padding = max(0.18, (x_max - x_min) * 0.18)
-        y_padding = max(0.18, (y_max - y_min) * 0.18)
+        x_min, x_max = _clamped_extent_from_points(
+            xs,
+            x_center,
+            min_size=PERSON_BOX_MIN_WIDTH_M,
+            max_size=PERSON_BOX_MAX_WIDTH_M,
+        )
+        y_min, y_max = _clamped_extent_from_points(
+            ys,
+            y_center,
+            min_size=PERSON_BOX_MIN_DEPTH_M,
+            max_size=PERSON_BOX_MAX_DEPTH_M,
+        )
         return (
             RadarBox3D(
-                x_min=float(x_min - x_padding),
-                x_max=float(x_max + x_padding),
-                y_min=float(y_min - y_padding),
-                y_max=float(y_max + y_padding),
+                x_min=float(x_min),
+                x_max=float(x_max),
+                y_min=float(y_min),
+                y_max=float(y_max),
                 z_min=float(z_min),
                 z_max=float(z_max),
                 label=f"ID {track.track_id}",
                 kind="track",
                 track_id=track.track_id,
             ),
-            "associated_points",
+            "associated_points_clamped",
         )
 
-    half_width = 0.32
-    half_depth = 0.32
+    half_width = PERSON_BOX_DEFAULT_WIDTH_M * 0.5
+    half_depth = PERSON_BOX_DEFAULT_DEPTH_M * 0.5
     return (
         RadarBox3D(
             x_min=float(x_center - half_width),
@@ -1194,6 +1515,10 @@ class IWR6843Driver(FrameSource):
         self._cli_log_text = ""
         self._run_dir: Optional[Path] = None
         self._report_path: Optional[Path] = None
+        self._frame_debug_path: Optional[Path] = None
+        self._frame_debug_file: Optional[Any] = None
+        self._last_frame_debug_flush = 0.0
+        self._tracking_debug = TrackingStabilityMonitor()
         self._scene_metadata = RadarSceneMetadata(config_source=config_path)
         self._previous_points_for_indexes: List[RadarPoint] = []
 
@@ -1253,6 +1578,8 @@ class IWR6843Driver(FrameSource):
             probe_log_tail=self._probe_log_tail,
             run_dir=str(self._run_dir) if self._run_dir else "",
             report_path=str(self._report_path) if self._report_path else "",
+            frame_debug_path=str(self._frame_debug_path) if self._frame_debug_path else "",
+            tracking_debug=self._tracking_debug.to_dict(),
         )
 
     def note_frame_rendered(self, frame: Optional[RadarFrame]) -> None:
@@ -1289,6 +1616,7 @@ class IWR6843Driver(FrameSource):
                 self._connection_error = f"No radar config file found at {config_path}"
                 logger.error(self._connection_error)
                 self._persist_session_artifacts()
+                self._close_frame_debug()
                 return False
 
         try:
@@ -1302,6 +1630,7 @@ class IWR6843Driver(FrameSource):
             logger.error(self._connection_error)
             self._cleanup_serial()
             self._persist_session_artifacts()
+            self._close_frame_debug()
             return False
 
         self._scene_metadata = scene_metadata_from_cfg_path(self._config_path)
@@ -1317,6 +1646,7 @@ class IWR6843Driver(FrameSource):
             logger.error(self._connection_error)
             self._cleanup_serial()
             self._persist_session_artifacts()
+            self._close_frame_debug()
             return False
 
         time.sleep(_CLI_POST_OPEN_SETTLE_S)
@@ -1336,6 +1666,7 @@ class IWR6843Driver(FrameSource):
         if not self._send_config():
             logger.error("Failed to send configuration")
             self._cleanup_serial()
+            self._close_frame_debug()
             self._persist_session_artifacts()
             return False
 
@@ -1378,6 +1709,7 @@ class IWR6843Driver(FrameSource):
         self._cleanup_serial()
         self._connected = False
         self._persist_session_artifacts()
+        self._close_frame_debug()
         logger.info("IWR6843 radar stopped")
 
     def get_point_cloud(self) -> List[RadarPoint]:
@@ -1386,6 +1718,13 @@ class IWR6843Driver(FrameSource):
             if not self._frame_buffer:
                 return []
             return list(self._frame_buffer[-1].points)
+
+    def get_tracks(self) -> List[RadarTrack]:
+        """Return the latest people-tracking targets."""
+        with self._lock:
+            if not self._frame_buffer:
+                return []
+            return copy.deepcopy(self._frame_buffer[-1].tracks)
 
     def get_latest_frame(self) -> Optional[RadarFrame]:
         with self._lock:
@@ -1424,6 +1763,7 @@ class IWR6843Driver(FrameSource):
     @property
     def diagnostics(self) -> Dict[str, Union[float, int, str, Dict[int, int]]]:
         state = self.session_state()
+        latest_frame = self.get_latest_frame()
         return {
             "frames": state.frames,
             "fps": state.fps,
@@ -1436,6 +1776,9 @@ class IWR6843Driver(FrameSource):
             "health_verdict": state.health_verdict,
             "health_reason": state.health_reason,
             "unknown_tlv_counts": state.unknown_tlv_counts,
+            "active_track_ids": []
+            if latest_frame is None
+            else [int(track.track_id) for track in latest_frame.tracks],
         }
 
     def parse_packet_bytes(self, packet: bytes) -> Optional[RadarFrame]:
@@ -1510,14 +1853,29 @@ class IWR6843Driver(FrameSource):
         self._previous_points_for_indexes = []
         self._probe_failed_stage = ""
         self._probe_log_tail = ""
+        self._tracking_debug.reset()
 
     def _start_run_artifacts(self) -> None:
+        self._close_frame_debug()
         _RUNS_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
         suffix = f"{int((time.time() % 1.0) * 1000):03d}"
         self._run_dir = _RUNS_DIR / f"{timestamp}_{suffix}"
         self._run_dir.mkdir(parents=True, exist_ok=True)
         self._report_path = self._run_dir / "session_report.json"
+        self._frame_debug_path = self._run_dir / "frames.jsonl"
+        self._frame_debug_file = self._frame_debug_path.open("a", encoding="utf-8", buffering=1)
+        self._write_frame_debug_event(
+            {
+                "type": "session_start",
+                "timestamp": time.time(),
+                "config_port": self._config_port_path,
+                "data_port": self._data_port_path,
+                "config_path": self._config_path,
+                "config_baud": self._config_baud,
+                "data_baud": self._data_baud,
+            }
+        )
 
     def _append_cli_log(self, text: Union[str, bytes]) -> None:
         if isinstance(text, bytes):
@@ -1546,6 +1904,36 @@ class IWR6843Driver(FrameSource):
             )
         except Exception as exc:
             logger.warning("Failed to persist radar diagnostics artifacts: %s", exc)
+
+    def _write_frame_debug_event(self, payload: Dict[str, Any]) -> None:
+        if self._frame_debug_file is None:
+            return
+        try:
+            self._frame_debug_file.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+            now = time.time()
+            if now - self._last_frame_debug_flush >= 1.0:
+                self._frame_debug_file.flush()
+                self._last_frame_debug_flush = now
+        except Exception as exc:
+            logger.warning("Failed to write radar frame debug event: %s", exc)
+            self._close_frame_debug()
+
+    def _record_frame_debug(self, frame: RadarFrame) -> None:
+        self._tracking_debug.update(frame)
+        payload = radar_frame_debug_payload(frame, include_points=True, max_points=256)
+        payload["type"] = "frame"
+        self._write_frame_debug_event(payload)
+
+    def _close_frame_debug(self) -> None:
+        if self._frame_debug_file is None:
+            return
+        try:
+            self._frame_debug_file.flush()
+            self._frame_debug_file.close()
+        except Exception:
+            pass
+        finally:
+            self._frame_debug_file = None
 
     def _plots_updating(self, latest_frame: Optional[RadarFrame]) -> bool:
         if latest_frame is None or self._last_rendered_at is None:
@@ -1728,6 +2116,7 @@ class IWR6843Driver(FrameSource):
                         self._frame_buffer.append(frame)
                         self._frame_count += 1
                         self._frame_timestamps.append(frame.timestamp)
+                    self._record_frame_debug(frame)
 
             except Exception as exc:
                 if self._running:
@@ -1792,7 +2181,7 @@ class IWR6843Driver(FrameSource):
             parsed_indexes = self._parse_track_indexes_tlv(
                 tlv_type,
                 payload,
-                point_count=len(self._previous_points_for_indexes),
+                point_count=len(points) or len(self._previous_points_for_indexes),
             )
             if parsed_indexes is not None:
                 track_indexes = parsed_indexes
@@ -1803,7 +2192,7 @@ class IWR6843Driver(FrameSource):
                 presence = parsed_presence
                 continue
 
-            if tlv_type != TLV_SIDE_INFO:
+            if tlv_type not in TLV_SIDE_INFO_TYPES:
                 self._unknown_tlv_counts[int(tlv_type)] += 1
                 lengths = self._unknown_tlv_lengths[int(tlv_type)]
                 lengths.append(int(tlv_length))
@@ -1812,7 +2201,7 @@ class IWR6843Driver(FrameSource):
 
         finalized_tracks = finalize_tracks(
             tracks,
-            points_for_indexing=self._previous_points_for_indexes,
+            points_for_indexing=points or self._previous_points_for_indexes,
             track_indexes=track_indexes,
             heights_by_track=heights_by_track,
         )
@@ -1844,8 +2233,7 @@ class IWR6843Driver(FrameSource):
             return self._parse_raw_cartesian_points(payload)
 
         if tlv_type not in (
-            TLV_COMPRESSED_POINTS,
-            TLV_COMPRESSED_POINTS_LEGACY,
+            *TLV_COMPRESSED_POINT_TYPES,
             TLV_DETECTED_OBJECTS,
         ) and len(payload) >= _TRACK_RECORD_SHORT_STRUCT.size:
             return None
@@ -1861,7 +2249,11 @@ class IWR6843Driver(FrameSource):
         tlv_type: int,
         payload: bytes,
     ) -> Optional[List[RadarTrack]]:
-        if tlv_type != TLV_TRACK_LIST and len(payload) % _TRACK_RECORD_SHORT_STRUCT.size != 0 and len(payload) % _TRACK_RECORD_LONG_STRUCT.size != 0:
+        if tlv_type in TLV_TRACK_LIST_TYPES:
+            return _parse_target_list_payload(payload)
+        if tlv_type in KNOWN_TLV_TYPES:
+            return None
+        if len(payload) % _TRACK_RECORD_SHORT_STRUCT.size != 0 and len(payload) % _TRACK_RECORD_LONG_STRUCT.size != 0:
             return None
         return _parse_target_list_payload(payload)
 
@@ -1870,7 +2262,11 @@ class IWR6843Driver(FrameSource):
         tlv_type: int,
         payload: bytes,
     ) -> Optional[Dict[int, Tuple[float, float]]]:
-        if tlv_type != TLV_TRACK_HEIGHT and len(payload) % _TRACK_HEIGHT_STRUCT.size != 0:
+        if tlv_type in TLV_TRACK_HEIGHT_TYPES:
+            return _parse_height_payload(payload)
+        if tlv_type in KNOWN_TLV_TYPES:
+            return None
+        if len(payload) % _TRACK_HEIGHT_STRUCT.size != 0:
             return None
         return _parse_height_payload(payload)
 
@@ -1882,7 +2278,11 @@ class IWR6843Driver(FrameSource):
         point_count: int,
     ) -> Optional[List[int]]:
         expected_counts = {count for count in (point_count, len(self._previous_points_for_indexes)) if count > 0}
-        if tlv_type != TLV_TRACK_INDEX and (not expected_counts or len(payload) not in expected_counts):
+        if tlv_type in TLV_TRACK_INDEX_TYPES:
+            return _parse_target_index_payload(payload)
+        if tlv_type in KNOWN_TLV_TYPES:
+            return None
+        if not expected_counts or len(payload) not in expected_counts:
             return None
         return _parse_target_index_payload(payload)
 
@@ -1893,18 +2293,12 @@ class IWR6843Driver(FrameSource):
     ) -> Optional[int]:
         if len(payload) != 4:
             return None
-        if tlv_type != TLV_PRESENCE and tlv_type in (
-            TLV_DETECTED_OBJECTS,
-            TLV_SIDE_INFO,
-            TLV_COMPRESSED_POINTS,
-            TLV_COMPRESSED_POINTS_LEGACY,
-            TLV_TRACK_LIST,
-            TLV_TRACK_INDEX,
-            TLV_TRACK_HEIGHT,
-        ):
+        if tlv_type in TLV_PRESENCE_TYPES:
+            return int(struct.unpack_from("<I", payload, 0)[0])
+        if tlv_type in KNOWN_TLV_TYPES:
             return None
         value = struct.unpack_from("<I", payload, 0)[0]
-        if tlv_type != TLV_PRESENCE and value > 16:
+        if value > 16:
             return None
         return int(value)
 
@@ -1955,8 +2349,8 @@ class IWR6843Driver(FrameSource):
             snr = float(snr_i) * snr_unit
 
             x, y, z = self._spherical_to_cartesian(
-                azimuth_deg=azimuth,
-                elevation_deg=elevation,
+                azimuth_rad=azimuth,
+                elevation_rad=elevation,
                 distance_m=distance,
             )
             points.append(RadarPoint(x=x, y=y, z=z, velocity=velocity, snr=snr))
@@ -1986,17 +2380,15 @@ class IWR6843Driver(FrameSource):
 
     @staticmethod
     def _spherical_to_cartesian(
-        azimuth_deg: float,
-        elevation_deg: float,
+        azimuth_rad: float,
+        elevation_rad: float,
         distance_m: float,
     ) -> Tuple[float, float, float]:
-        azimuth = math.radians(azimuth_deg)
-        elevation = math.radians(elevation_deg)
-        cos_el = math.cos(elevation)
+        cos_el = math.cos(elevation_rad)
 
-        x = distance_m * math.sin(azimuth) * cos_el
-        y = distance_m * math.cos(azimuth) * cos_el
-        z = distance_m * math.sin(elevation)
+        x = distance_m * math.sin(azimuth_rad) * cos_el
+        y = distance_m * math.cos(azimuth_rad) * cos_el
+        z = distance_m * math.sin(elevation_rad)
         return float(x), float(y), float(z)
 
 
@@ -2080,6 +2472,10 @@ class ReplayRadarSource(FrameSource):
     def get_point_cloud(self) -> List[RadarPoint]:
         frame = self.latest_frame()
         return [] if frame is None else list(frame.points)
+
+    def get_tracks(self) -> List[RadarTrack]:
+        frame = self.latest_frame()
+        return [] if frame is None else copy.deepcopy(frame.tracks)
 
     def get_latest_frame(self) -> Optional[RadarFrame]:
         return self.latest_frame()
@@ -2207,6 +2603,10 @@ class MockRadar(FrameSource):
         self._frame_count += 1
         target = self.get_target_3d()
         return [RadarPoint(x=target[0], y=target[1], z=target[2], velocity=0.0)]
+
+    def get_tracks(self) -> List[RadarTrack]:
+        frame = self.latest_frame()
+        return [] if frame is None else copy.deepcopy(frame.tracks)
 
     def get_latest_frame(self) -> Optional[RadarFrame]:
         return self.latest_frame()

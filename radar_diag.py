@@ -131,6 +131,18 @@ def read_command_response(
     return bytes(cfg_buf), bytes(data_buf)
 
 
+def stop_sensor_before_close(cfg_ser: serial.Serial) -> bytes:
+    """Best-effort cleanup so diagnostics do not leave the demo streaming."""
+
+    try:
+        cfg_ser.write(b"sensorStop\n")
+        response, _ = read_command_response(cfg_ser, None, "sensorStop", 1.5)
+        response += drain_serial(cfg_ser, 0.2)
+        return response
+    except Exception:
+        return b""
+
+
 def run_cfg_once(
     commands: Sequence[str],
     config_port: str,
@@ -183,6 +195,8 @@ def run_cfg_once(
             except Exception:
                 pass
             data_ser.close()
+        if ok:
+            config_logs.extend(stop_sensor_before_close(cfg_ser))
         config_logs.extend(drain_serial(cfg_ser, 0.2))
         cfg_ser.close()
 

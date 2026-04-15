@@ -118,6 +118,9 @@ class PacketParsingTests(unittest.TestCase):
         self.assertEqual(frame.frame_number, 42)
         self.assertEqual(len(frame.points), 2)
         self.assertAlmostEqual(frame.points[0].velocity, -0.3, places=4)
+        self.assertAlmostEqual(frame.points[0].x, 0.1995, places=3)
+        self.assertAlmostEqual(frame.points[0].y, 1.9884, places=3)
+        self.assertAlmostEqual(frame.points[0].z, 0.0800, places=3)
         self.assertGreater(frame.points[0].snr, 0.0)
 
     def test_parse_bad_header(self):
@@ -204,8 +207,76 @@ class PacketParsingTests(unittest.TestCase):
         assert frame.tracks[0].bbox is not None
         self.assertAlmostEqual(frame.tracks[0].bbox.z_min, 0.12, places=4)
         self.assertAlmostEqual(frame.tracks[0].bbox.z_max, 1.82, places=4)
-        self.assertEqual(frame.tracks[0].bbox_source, "associated_points")
+        self.assertEqual(frame.tracks[0].bbox_source, "associated_points_clamped")
         self.assertEqual(frame.calibration["camera_projection_hook"]["tracks_ready"], True)
+
+    def test_parse_3d_people_counting_tlv_aliases_with_multiple_tracks(self):
+        driver = radar.IWR6843Driver()
+
+        units = struct.pack("<5f", 0.01, 0.01, 0.25, 0.1, 0.5)
+        points = b"".join(
+            [
+                struct.pack("<bbHhH", 0, 0, 8, 0, 5),
+                struct.pack("<bbHhH", 2, 0, 9, 0, 5),
+                struct.pack("<bbHhH", 10, 1, 12, 0, 8),
+                struct.pack("<bbHhH", 12, 1, 13, 0, 8),
+            ]
+        )
+        track_payload = b"".join(
+            [
+                build_short_track_record(1, x=0.02, y=2.0, z=1.0, confidence=0.95),
+                build_short_track_record(2, x=0.45, y=3.0, z=1.1, confidence=0.93),
+            ]
+        )
+        height_payload = radar._TRACK_HEIGHT_STRUCT.pack(1, 1.78, 0.10)
+        height_payload += radar._TRACK_HEIGHT_STRUCT.pack(2, 1.86, 0.12)
+        index_payload = bytes([1, 1, 2, 2])
+        presence_payload = struct.pack("<I", 1)
+
+        packet = build_packet(
+            [
+                (radar.TLV_3D_PEOPLE_COMPRESSED_POINTS, units + points),
+                (radar.TLV_3D_PEOPLE_TRACK_LIST, track_payload),
+                (radar.TLV_3D_PEOPLE_TRACK_HEIGHT, height_payload),
+                (radar.TLV_3D_PEOPLE_TRACK_INDEX, index_payload),
+                (radar.TLV_3D_PEOPLE_PRESENCE, presence_payload),
+            ],
+            frame_number=7,
+            num_detected_obj=4,
+        )
+
+        frame = driver.parse_packet_bytes(packet)
+        self.assertIsNotNone(frame)
+        assert frame is not None
+        self.assertEqual(len(frame.points), 4)
+        self.assertEqual(len(frame.tracks), 2)
+        self.assertEqual([track.track_id for track in frame.tracks], [1, 2])
+        self.assertEqual(frame.track_indexes, [1, 1, 2, 2])
+        self.assertEqual(frame.presence, 1)
+        self.assertNotIn(radar.TLV_3D_PEOPLE_COMPRESSED_POINTS, driver.session_state().unknown_tlv_counts)
+        self.assertNotIn(radar.TLV_3D_PEOPLE_TRACK_INDEX, driver.session_state().unknown_tlv_counts)
+        for track in frame.tracks:
+            self.assertIsNotNone(track.bbox)
+            assert track.bbox is not None
+            self.assertLessEqual(track.bbox.width, radar.PERSON_BOX_MAX_WIDTH_M + 1e-9)
+            self.assertLessEqual(track.bbox.depth, radar.PERSON_BOX_MAX_DEPTH_M + 1e-9)
+
+    def test_associated_points_do_not_make_giant_person_boxes(self):
+        track = radar.RadarTrack(track_id=1, x=0.0, y=2.0, z=1.0)
+        points = [
+            radar.RadarPoint(x=-5.0, y=0.5, z=0.2, velocity=0.0),
+            radar.RadarPoint(x=0.0, y=2.0, z=1.0, velocity=0.0),
+            radar.RadarPoint(x=5.0, y=6.0, z=2.5, velocity=0.0),
+        ]
+        bbox, source = radar._build_track_bbox(
+            track,
+            associated_points=points,
+            height_range=None,
+        )
+        self.assertEqual(source, "associated_points_clamped")
+        self.assertLessEqual(bbox.width, radar.PERSON_BOX_MAX_WIDTH_M + 1e-9)
+        self.assertLessEqual(bbox.depth, radar.PERSON_BOX_MAX_DEPTH_M + 1e-9)
+        self.assertLessEqual(bbox.height, radar.PERSON_BOX_MAX_HEIGHT_M + 1e-9)
 
     def test_project_box_to_camera(self):
         capture = radar.load_replay_capture(ROOT / "04_01_2026_16_12_52" / "replay_8.json")
@@ -215,6 +286,93 @@ class PacketParsingTests(unittest.TestCase):
         self.assertEqual(len(projection["tracks"]), len(frame.tracks))
         self.assertEqual(len(projection["points"]), len(frame.points))
         self.assertIsNotNone(projection["tracks"][0]["uv_bbox"])
+
+    def test_frame_debug_payload_summarizes_tracks_and_points(self):
+        bbox = radar.RadarBox3D(
+            x_min=-0.3,
+            x_max=0.3,
+            y_min=1.7,
+            y_max=2.3,
+            z_min=0.0,
+            z_max=1.8,
+            track_id=4,
+        )
+        frame = radar.RadarFrame(
+            frame_number=10,
+            subframe_number=0,
+            num_detected_obj=2,
+            num_tlvs=4,
+            points=[
+                radar.RadarPoint(x=-0.1, y=2.0, z=0.5, velocity=-0.2, snr=8.0),
+                radar.RadarPoint(x=0.1, y=2.2, z=1.0, velocity=0.3, snr=10.0),
+            ],
+            timestamp=123.0,
+            tracks=[
+                radar.RadarTrack(
+                    track_id=4,
+                    x=0.0,
+                    y=2.0,
+                    z=1.0,
+                    confidence=0.9,
+                    bbox=bbox,
+                    associated_point_indexes=[0, 1],
+                    bbox_source="test",
+                )
+            ],
+            track_indexes=[4, 4],
+            presence=1,
+        )
+
+        payload = radar.radar_frame_debug_payload(frame, include_points=True)
+        self.assertEqual(payload["frame_number"], 10)
+        self.assertEqual(payload["point_count"], 2)
+        self.assertEqual(payload["track_count"], 1)
+        self.assertEqual(payload["track_index_counts"], {"4": 2})
+        self.assertAlmostEqual(payload["tracks"][0]["bbox"]["height"], 1.8)
+
+    def test_tracking_stability_monitor_flags_gaps_and_id_switches(self):
+        monitor = radar.TrackingStabilityMonitor()
+        monitor.update(
+            radar.RadarFrame(
+                frame_number=1,
+                subframe_number=0,
+                num_detected_obj=1,
+                num_tlvs=1,
+                points=[radar.RadarPoint(0.0, 2.0, 1.0, 0.0)],
+                timestamp=1.0,
+                presence=1,
+            )
+        )
+        monitor.update(
+            radar.RadarFrame(
+                frame_number=2,
+                subframe_number=0,
+                num_detected_obj=1,
+                num_tlvs=2,
+                points=[radar.RadarPoint(0.0, 2.0, 1.0, 0.0)],
+                timestamp=2.0,
+                tracks=[radar.RadarTrack(track_id=1, x=0.0, y=2.0, z=1.0)],
+                presence=1,
+            )
+        )
+        monitor.update(
+            radar.RadarFrame(
+                frame_number=3,
+                subframe_number=0,
+                num_detected_obj=1,
+                num_tlvs=2,
+                points=[radar.RadarPoint(0.0, 2.0, 1.0, 0.0)],
+                timestamp=3.0,
+                tracks=[radar.RadarTrack(track_id=2, x=0.0, y=2.0, z=1.0)],
+                presence=1,
+            )
+        )
+
+        summary = monitor.to_dict()
+        self.assertEqual(summary["frames_presence_without_tracks"], 1)
+        self.assertEqual(summary["frames_points_without_tracks"], 1)
+        self.assertEqual(summary["single_track_id_switches"], 1)
+        self.assertEqual(summary["unique_track_ids"], [1, 2])
 
 
 class HealthVerdictTests(unittest.TestCase):
@@ -297,6 +455,22 @@ class HealthVerdictTests(unittest.TestCase):
         self.assertEqual(verdict, radar.HEALTH_HEALTHY)
         self.assertIn("plots are updating", reason)
 
+    def test_headless_frames_are_healthy_without_plot_updates(self):
+        verdict, reason = radar.evaluate_health_verdict(
+            mode="live",
+            config_ok=True,
+            last_command_error="",
+            connection_error="",
+            rx_bytes=4096,
+            magic_hits=10,
+            frames=8,
+            last_parse_error="",
+            data_opened_at=time.time() - 1.0,
+            plots_updating=False,
+        )
+        self.assertEqual(verdict, radar.HEALTH_HEALTHY)
+        self.assertIn("frames are parsing", reason.lower())
+
 
 class PortDiscoveryTests(unittest.TestCase):
     def test_cp2105_pairing(self):
@@ -343,6 +517,31 @@ class PortDiscoveryTests(unittest.TestCase):
                 ),
             ]
         )
+        self.assertEqual(radar.suggest_serial_port_pairs(infos)[0], ("/dev/ttyACM0", "/dev/ttyACM1"))
+
+    def test_xds110_generic_cmsis_dap_pairing_from_location(self):
+        infos = radar.discover_serial_ports(
+            [
+                SimpleNamespace(
+                    device="/dev/ttyACM0",
+                    description="XDS110 (03.00.00.02) Embed with CMSIS-DAP",
+                    manufacturer="Texas Instruments",
+                    product="",
+                    interface="",
+                    hwid="USB VID:PID=0451:BEF3 SER=R0081038 LOCATION=1-2.1:1.0",
+                ),
+                SimpleNamespace(
+                    device="/dev/ttyACM1",
+                    description="XDS110 (03.00.00.02) Embed with CMSIS-DAP",
+                    manufacturer="Texas Instruments",
+                    product="",
+                    interface="",
+                    hwid="USB VID:PID=0451:BEF3 SER=R0081038 LOCATION=1-2.1:1.3",
+                ),
+            ]
+        )
+        self.assertEqual(infos[0].role_hint, "config")
+        self.assertEqual(infos[1].role_hint, "data")
         self.assertEqual(radar.suggest_serial_port_pairs(infos)[0], ("/dev/ttyACM0", "/dev/ttyACM1"))
 
 
