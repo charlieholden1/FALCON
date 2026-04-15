@@ -80,11 +80,14 @@ from radar_camera_fusion import (
     FusionEventLogger,
     FusionMode,
     RadarCameraFusionManager,
+    backproject_pixel,
     capture_calibration_sample,
     project_radar_track_bbox,
     save_calibration_samples,
+    solve_calibration_auto,
     solve_calibration_samples,
 )
+from camera_stream import get_depth_meters
 
 logger = logging.getLogger("falcon.gui")
 
@@ -332,6 +335,7 @@ class VisionPipeline:
         self._latest_frame: Optional[np.ndarray] = None
         self._latest_tracks = []
         self._latest_radar_frame = None
+        self._latest_depth_frame: Optional[np.ndarray] = None
         self._last_frame_shape = None
 
         # FPS bookkeeping
@@ -538,21 +542,21 @@ class VisionPipeline:
         if self._webcam is None:
             return None
 
-        if (hasattr(self._webcam, '_rs_pipeline')
-                and self._webcam._rs_pipeline is not None):
-            try:
-                import pyrealsense2 as rs
-                profile = self._webcam._rs_pipeline.get_active_profile()
-                intr = (profile.get_stream(rs.stream.color)
-                        .as_video_stream_profile().get_intrinsics())
-                logger.info("Using RealSense intrinsics for projection")
-                return np.array([
-                    [intr.fx, 0.0, intr.ppx],
-                    [0.0, intr.fy, intr.ppy],
-                    [0.0, 0.0, 1.0],
-                ], dtype=np.float64)
-            except Exception:
-                pass
+        # Prefer the factory-calibrated RealSense intrinsics exposed by
+        # DualStreamCamera.get_color_intrinsics() (captured at pipeline
+        # start). Falls back to the legacy direct _rs_pipeline probe if
+        # something upstream missed them.
+        try:
+            intr = self._webcam.get_color_intrinsics()
+        except Exception:
+            intr = None
+        if intr:
+            logger.info("Using RealSense intrinsics for projection")
+            return np.array([
+                [float(intr["fx"]), 0.0, float(intr["cx"])],
+                [0.0, float(intr["fy"]), float(intr["cy"])],
+                [0.0, 0.0, 1.0],
+            ], dtype=np.float64)
 
         width = height = 0.0
         cap = getattr(self._webcam, "_cap", None)
@@ -743,6 +747,7 @@ class VisionPipeline:
         self._frame_count = 0
         self._latest_tracks = []
         self._latest_radar_frame = None
+        self._latest_depth_frame = None
         if self._webcam is not None:
             self._webcam.start()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -765,6 +770,7 @@ class VisionPipeline:
             self._latest_frame = None
             self._latest_tracks = []
             self._latest_radar_frame = None
+            self._latest_depth_frame = None
 
     @property
     def running(self) -> bool:
@@ -820,6 +826,7 @@ class VisionPipeline:
         with self._lock:
             tracks = list(self._latest_tracks)
             radar_frame = self._latest_radar_frame
+            depth_frame = self._latest_depth_frame
         click_uv = self._calibration_click_uv
         sample = capture_calibration_sample(
             tracks,
@@ -827,6 +834,15 @@ class VisionPipeline:
             image_uv_override=click_uv,
             allow_point_cloud_fallback=self.allow_point_cloud_calibration,
         )
+        # Enrich with camera-frame 3-D point from RealSense depth so the
+        # solver can run the closed-form Umeyama 3-D <-> 3-D fit.
+        u_val, v_val = float(sample.image_uv[0]), float(sample.image_uv[1])
+        depth_m = get_depth_meters(depth_frame, int(round(u_val)), int(round(v_val)))
+        if depth_m is not None and self.projection is not None:
+            xyz = backproject_pixel(u_val, v_val, depth_m, self.projection)
+            if xyz is not None:
+                sample.camera_xyz = [float(xyz[0]), float(xyz[1]), float(xyz[2])]
+                sample.depth_m = float(depth_m)
         self._calibration_samples.append(sample)
         self._calibration_click_uv = None
         if self._fusion_run_dir is not None:
@@ -834,9 +850,13 @@ class VisionPipeline:
                 self._calibration_samples,
                 self._fusion_run_dir / "calibration_samples.json",
             )
+        depth_tag = (
+            f"; depth={sample.depth_m:.2f}m"
+            if sample.depth_m is not None else "; depth=n/a"
+        )
         return (
             f"Captured sample {len(self._calibration_samples)} "
-            f"({self._format_calibration_link(sample)}; {sample.source})."
+            f"({self._format_calibration_link(sample)}; {sample.source}{depth_tag})."
         )
 
     @staticmethod
@@ -852,7 +872,13 @@ class VisionPipeline:
 
     def solve_calibration_samples(self) -> str:
         seeded_intrinsics = self.apply_camera_intrinsics_guess()
-        result = solve_calibration_samples(self._calibration_samples, self.ensure_projection())
+        # solve_calibration_auto prefers the 3-D <-> 3-D Umeyama path when
+        # enough depth-backprojected samples exist, and transparently falls
+        # back to the legacy 2-D reprojection solve otherwise.
+        result = solve_calibration_auto(
+            self._calibration_samples,
+            self.ensure_projection(),
+        )
         if not result.ok:
             return result.message
         self.apply_projection_params(**result.params)
@@ -1007,6 +1033,7 @@ class VisionPipeline:
                 self._latest_frame = vis
                 self._latest_tracks = list(tracks)
                 self._latest_radar_frame = radar_frame
+                self._latest_depth_frame = depth_frame
 
     # ── detection dispatch ───────────────────────────────────────────
 
@@ -1295,6 +1322,50 @@ class VisionPipeline:
             0.55,
             colour,
             2,
+            cv2.LINE_AA,
+        )
+
+        # Draw a correction arrow from the current projected radar track
+        # position to the click location so the operator can visually see
+        # the offset that this sample will correct.
+        radar_frame = self._latest_radar_frame
+        projection = self.projection
+        if radar_frame is None or projection is None or not radar_frame.tracks:
+            return
+        best_track = None
+        best_dist = float("inf")
+        for track in radar_frame.tracks:
+            try:
+                ru, rv = projection.project_3d_to_2d(track.position_3d)
+            except Exception:
+                continue
+            dist = (ru - u) ** 2 + (rv - v) ** 2
+            if dist < best_dist:
+                best_dist = dist
+                best_track = (track, int(ru), int(rv))
+        if best_track is None:
+            return
+        track, ru, rv = best_track
+        if not (0 <= ru < w_frame and 0 <= rv < h_frame):
+            return
+        cv2.arrowedLine(
+            vis,
+            (ru, rv),
+            point,
+            (0, 180, 255),
+            2,
+            cv2.LINE_AA,
+            tipLength=0.18,
+        )
+        offset_px = float(np.hypot(u - ru, v - rv))
+        cv2.putText(
+            vis,
+            f"R{track.track_id} -> click: {offset_px:.0f}px",
+            (ru + 6, rv - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 180, 255),
+            1,
             cv2.LINE_AA,
         )
 

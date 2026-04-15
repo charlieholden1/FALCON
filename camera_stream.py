@@ -99,6 +99,10 @@ class DualStreamCamera:
         self._rs_pipeline = None
         self._rs_align = None
         self._using_realsense = False
+        # Populated during _init_realsense or _init_webcam so downstream
+        # projection code can size the image plane correctly.
+        self._color_intrinsics: Optional[dict] = None
+        self._frame_size: Optional[Tuple[int, int]] = None
 
         self._cap: Optional[cv2.VideoCapture] = None
         self._q: Optional[queue.Queue] = None
@@ -233,6 +237,31 @@ class DualStreamCamera:
         # different native resolutions
         self._rs_align = rs.align(rs.stream.color)
 
+        # Capture factory-calibrated colour intrinsics so CameraProjection
+        # can drop the hard-coded defaults (fx=fy=800, cx=640, cy=360).
+        try:
+            color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            intr = color_profile.get_intrinsics()
+            self._color_intrinsics = {
+                "fx": float(intr.fx),
+                "fy": float(intr.fy),
+                "cx": float(intr.ppx),
+                "cy": float(intr.ppy),
+                "width": int(intr.width),
+                "height": int(intr.height),
+                "model": str(intr.model).split(".")[-1],
+                "coeffs": [float(c) for c in intr.coeffs],
+            }
+            self._frame_size = (int(intr.width), int(intr.height))
+            print(
+                f"[FALCON] RealSense intrinsics: "
+                f"fx={intr.fx:.1f} fy={intr.fy:.1f} "
+                f"cx={intr.ppx:.1f} cy={intr.ppy:.1f} "
+                f"{intr.width}x{intr.height}"
+            )
+        except Exception as exc:
+            print(f"[FALCON] Could not read RealSense intrinsics: {exc}")
+
         # ── Fix overexposure on the RGB sensor ──────────────────────
         device = profile.get_device()
         for sensor in device.query_sensors():
@@ -304,6 +333,7 @@ class DualStreamCamera:
                 cap.release()
                 cap = None
             else:
+                self._frame_size = (int(actual_w), int(actual_h))
                 print(
                     f"[FALCON] Webcam fallback active: "
                     f"{actual_w}x{actual_h} @ {actual_fps}FPS"
@@ -385,6 +415,19 @@ class DualStreamCamera:
     def has_depth(self) -> bool:
         """True when the camera supplies native depth frames."""
         return self._using_realsense
+
+    def get_color_intrinsics(self) -> Optional[dict]:
+        """
+        Return factory-calibrated colour intrinsics when a RealSense is in
+        use, or ``None`` for the webcam fallback.
+
+        Keys: fx, fy, cx, cy, width, height, model, coeffs.
+        """
+        return dict(self._color_intrinsics) if self._color_intrinsics else None
+
+    def get_frame_size(self) -> Optional[Tuple[int, int]]:
+        """Return (width, height) of the active colour stream when known."""
+        return self._frame_size
 
     # ── read ────────────────────────────────────────────────────────
 

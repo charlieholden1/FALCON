@@ -82,7 +82,13 @@ class FusionDebugSnapshot:
 
 @dataclass
 class CalibrationSample:
-    """One radar/camera correspondence for guided extrinsic calibration."""
+    """One radar/camera correspondence for guided extrinsic calibration.
+
+    ``camera_xyz`` and ``depth_m`` are optional 3-D enrichments populated
+    when a RealSense depth stream is available. They let the solver run a
+    closed-form 3-D ↔ 3-D Umeyama fit instead of the under-constrained 2-D
+    reprojection solve.
+    """
 
     radar_xyz: List[float]
     image_uv: List[float]
@@ -91,9 +97,11 @@ class CalibrationSample:
     timestamp: float = field(default_factory=time.time)
     confidence: float = 1.0
     source: str = "auto_pose"
+    camera_xyz: Optional[List[float]] = None
+    depth_m: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "radar_xyz": [float(value) for value in self.radar_xyz],
             "image_uv": [float(value) for value in self.image_uv],
             "camera_track_id": int(self.camera_track_id),
@@ -102,9 +110,15 @@ class CalibrationSample:
             "confidence": float(self.confidence),
             "source": str(self.source),
         }
+        if self.camera_xyz is not None:
+            payload["camera_xyz"] = [float(value) for value in self.camera_xyz]
+        if self.depth_m is not None:
+            payload["depth_m"] = float(self.depth_m)
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "CalibrationSample":
+        camera_xyz = payload.get("camera_xyz")
         return cls(
             radar_xyz=[float(value) for value in payload["radar_xyz"]],
             image_uv=[float(value) for value in payload["image_uv"]],
@@ -113,6 +127,8 @@ class CalibrationSample:
             timestamp=float(payload.get("timestamp", time.time())),
             confidence=float(payload.get("confidence", 1.0)),
             source=str(payload.get("source", "auto_pose")),
+            camera_xyz=[float(v) for v in camera_xyz] if camera_xyz else None,
+            depth_m=float(payload["depth_m"]) if "depth_m" in payload and payload["depth_m"] is not None else None,
         )
 
 
@@ -780,6 +796,190 @@ def solve_calibration_samples(
         mean_error_px=mean_error,
         median_error_px=median_error,
         sample_count=len(samples),
+    )
+
+
+def backproject_pixel(
+    u: float,
+    v: float,
+    depth_m: float,
+    projection: CameraProjection,
+) -> Optional[Tuple[float, float, float]]:
+    """Back-project an image pixel into a camera-frame 3-D point.
+
+    ``projection`` supplies fx, fy, cx, cy. ``depth_m`` is the RealSense
+    depth reading in metres at that pixel; returns ``None`` when depth is
+    missing, zero, or non-finite.
+    """
+    if depth_m is None:
+        return None
+    try:
+        z = float(depth_m)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(z) or z <= 0.0:
+        return None
+    params = projection.params
+    fx = float(params.get("fx", 0.0))
+    fy = float(params.get("fy", 0.0))
+    if fx <= 0.0 or fy <= 0.0:
+        return None
+    cx = float(params.get("cx", 0.0))
+    cy = float(params.get("cy", 0.0))
+    x = (float(u) - cx) * z / fx
+    y = (float(v) - cy) * z / fy
+    return (x, y, z)
+
+
+def umeyama_rigid_transform(
+    src: np.ndarray,
+    dst: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Closed-form least-squares rigid transform (rotation + translation).
+
+    Solves ``dst_i ≈ R @ src_i + t`` for ``R ∈ SO(3)`` and ``t ∈ R^3`` using
+    Umeyama's SVD-based method. No scale. Returns ``(R, t, rmse)`` where rmse
+    is the residual in input units.
+
+    Inputs are Nx3 arrays. Requires N ≥ 3 non-degenerate correspondences.
+    """
+    src = np.asarray(src, dtype=np.float64).reshape(-1, 3)
+    dst = np.asarray(dst, dtype=np.float64).reshape(-1, 3)
+    if src.shape != dst.shape or src.shape[0] < 3:
+        raise ValueError("Umeyama needs matching Nx3 inputs with N >= 3.")
+
+    src_mean = src.mean(axis=0)
+    dst_mean = dst.mean(axis=0)
+    src_c = src - src_mean
+    dst_c = dst - dst_mean
+
+    # Cross-covariance; rows of src_c.T * dst_c produce the 3x3 H.
+    H = src_c.T @ dst_c
+    U, _s, Vt = np.linalg.svd(H)
+    # Correct for reflection so det(R) = +1.
+    reflect = np.eye(3)
+    if np.linalg.det(Vt.T @ U.T) < 0:
+        reflect[2, 2] = -1.0
+    R = Vt.T @ reflect @ U.T
+    t = dst_mean - R @ src_mean
+
+    # Residual rmse in source/target units.
+    projected = (R @ src.T).T + t
+    rmse = float(np.sqrt(np.mean(np.sum((projected - dst) ** 2, axis=1))))
+    return R, t, rmse
+
+
+def _projection_from_rigid(
+    R: np.ndarray,
+    t: np.ndarray,
+    base_projection: CameraProjection,
+) -> CameraProjection:
+    """Build a CameraProjection whose radar→camera transform equals (R, t)."""
+    rt = np.eye(4, dtype=np.float64)
+    rt[:3, :3] = R
+    rt[:3, 3] = t
+    return CameraProjection(K=base_projection.K.copy(), RT=rt)
+
+
+def solve_calibration_3d(
+    samples: Sequence[CalibrationSample],
+    projection: CameraProjection,
+    *,
+    min_samples: int = 4,
+    max_median_error_px: float = 40.0,
+) -> CalibrationSolveResult:
+    """Solve radar→camera extrinsics from 3-D ↔ 3-D correspondences.
+
+    Uses Umeyama to recover the rigid transform in closed form (globally
+    optimal, no initial guess needed). Reprojection error in pixels is then
+    reported using the supplied intrinsics for UI feedback.
+
+    Only samples with ``camera_xyz`` populated participate. Call
+    ``solve_calibration_samples`` for the legacy 2-D reprojection fallback.
+    """
+    usable = [
+        s for s in samples
+        if s.camera_xyz is not None and len(s.camera_xyz) >= 3
+    ]
+    if len(usable) < min_samples:
+        return CalibrationSolveResult(
+            ok=False,
+            message=(
+                f"Need at least {min_samples} depth-backprojected samples for "
+                f"the 3-D solve; got {len(usable)} of {len(samples)}."
+            ),
+            sample_count=len(usable),
+        )
+
+    src = np.asarray([s.radar_xyz for s in usable], dtype=np.float64)
+    dst = np.asarray([s.camera_xyz for s in usable], dtype=np.float64)
+    try:
+        R, t, rmse_m = umeyama_rigid_transform(src, dst)
+    except (ValueError, np.linalg.LinAlgError) as exc:
+        return CalibrationSolveResult(
+            ok=False,
+            message=f"Umeyama solve failed: {exc}",
+            sample_count=len(usable),
+        )
+
+    solved = _projection_from_rigid(R, t, projection)
+    pixel_errors = _sample_pixel_errors(usable, solved)
+    mean_error = float(np.mean(pixel_errors)) if pixel_errors else 0.0
+    median_error = float(np.median(pixel_errors)) if pixel_errors else 0.0
+    params = solved.params
+
+    if median_error > max_median_error_px:
+        return CalibrationSolveResult(
+            ok=False,
+            message=(
+                f"3-D solve returned median pixel error {median_error:.1f}px "
+                f"(>{max_median_error_px:.0f}px). Likely cause: depth/intrinsics "
+                "mismatch or poorly separated samples. Retry with varied positions."
+            ),
+            params=params,
+            mean_error_px=mean_error,
+            median_error_px=median_error,
+            sample_count=len(usable),
+        )
+    return CalibrationSolveResult(
+        ok=True,
+        message=(
+            f"Umeyama solved {len(usable)} 3-D samples: rmse={rmse_m * 100.0:.1f}cm, "
+            f"median reprojection {median_error:.1f}px, mean {mean_error:.1f}px."
+        ),
+        params=params,
+        mean_error_px=mean_error,
+        median_error_px=median_error,
+        sample_count=len(usable),
+    )
+
+
+def solve_calibration_auto(
+    samples: Sequence[CalibrationSample],
+    projection: CameraProjection,
+    *,
+    min_samples_3d: int = 4,
+    min_samples_2d: int = 5,
+) -> CalibrationSolveResult:
+    """Prefer the 3-D ↔ 3-D solve when enough depth samples exist.
+
+    Falls back to the 2-D reprojection least-squares path otherwise so
+    setups without RealSense still work.
+    """
+    depth_count = sum(1 for s in samples if s.camera_xyz is not None)
+    if depth_count >= min_samples_3d:
+        result = solve_calibration_3d(
+            samples,
+            projection,
+            min_samples=min_samples_3d,
+        )
+        if result.ok:
+            return result
+        # Fall through to 2-D when the 3-D solve was rejected (e.g. bad depth).
+    return solve_calibration_samples(
+        samples,
+        projection,
+        min_samples=min_samples_2d,
     )
 
 

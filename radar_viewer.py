@@ -98,11 +98,14 @@ except Exception as exc:  # pragma: no cover - depends on runtime availability
 
 
 def _default_cfg_path() -> str:
+    # The people-tracking config is the only fusion-ready default. The OOB
+    # demo cfg (iwr6843_config.cfg) is intentionally NOT in the fallback
+    # chain because it ships without an onboard tracker and with static
+    # clutter removal, so fused tracking silently starves of track TLVs.
     preferred = Path("iwr6843_people_tracking.cfg")
     if preferred.exists():
         return str(preferred)
-    fallback = Path("iwr6843_config.cfg")
-    return str(fallback) if fallback.exists() else ""
+    return ""
 
 
 def _rgba_tuple(color_hex: str, alpha: float = 1.0) -> Tuple[float, float, float, float]:

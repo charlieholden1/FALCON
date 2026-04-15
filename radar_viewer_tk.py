@@ -808,11 +808,13 @@ class RadarViewerApp:
 
 
 def _default_cfg_path() -> str:
+    # Only the people-tracking cfg is fusion-ready. iwr6843_config.cfg is
+    # the OOB demo without an onboard tracker and is no longer offered as
+    # a silent fallback.
     preferred = Path("iwr6843_people_tracking.cfg")
     if preferred.exists():
         return str(preferred)
-    fallback = Path("iwr6843_config.cfg")
-    return str(fallback) if fallback.exists() else ""
+    return ""
 
 
 def parse_args() -> argparse.Namespace:

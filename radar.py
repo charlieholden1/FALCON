@@ -1478,12 +1478,19 @@ class IWR6843Driver(FrameSource):
         config_path: str = "iwr6843_people_tracking.cfg",
         config_baud: int = 115200,
         data_baud: int = 921600,
+        mount_geometry: Optional[Dict[str, Any]] = None,
     ):
         self._config_port_path = config_port
         self._data_port_path = data_port
         self._config_path = config_path
         self._config_baud = config_baud
         self._data_baud = data_baud
+        # Optional mount overrides applied before sending each command.
+        # Supported keys:
+        #   height_m, azimuth_tilt_deg, elevation_tilt_deg
+        #   boundary_box, static_boundary_box, presence_boundary_box
+        #       (each a 6-tuple: x_min x_max y_min y_max z_min z_max)
+        self._mount_geometry: Dict[str, Any] = dict(mount_geometry or {})
 
         self._config_serial: Optional[serial.Serial] = None  # type: ignore[name-defined]
         self._data_serial: Optional[serial.Serial] = None  # type: ignore[name-defined]
@@ -1958,6 +1965,7 @@ class IWR6843Driver(FrameSource):
             line = line.strip()
             if not line or line.startswith("%"):
                 continue
+            line = self._apply_mount_geometry(line)
             if line == "sensorStart":
                 has_sensor_start = True
             if line in ("sensorStop", "flushCfg", "sensorStart"):
@@ -1973,6 +1981,36 @@ class IWR6843Driver(FrameSource):
             if not self._send_command_with_retries("sensorStart", attempts=3, retry_delay=0.4):
                 return False
         return True
+
+    def _apply_mount_geometry(self, line: str) -> str:
+        """Rewrite a cfg command line using runtime mount geometry overrides."""
+        if not self._mount_geometry:
+            return line
+        parts = line.split()
+        if not parts:
+            return line
+        cmd = parts[0]
+        geom = self._mount_geometry
+
+        if cmd == "sensorPosition":
+            height = geom.get("height_m")
+            az = geom.get("azimuth_tilt_deg", 0.0)
+            el = geom.get("elevation_tilt_deg", 0.0)
+            if height is not None:
+                return f"sensorPosition {float(height):.4f} {float(az):.4f} {float(el):.4f}"
+
+        box_key_map = {
+            "boundaryBox": "boundary_box",
+            "staticBoundaryBox": "static_boundary_box",
+            "presenceBoundaryBox": "presence_boundary_box",
+        }
+        key = box_key_map.get(cmd)
+        if key and key in geom:
+            box = geom[key]
+            if len(box) >= 6:
+                vals = " ".join(f"{float(v):.4f}" for v in box[:6])
+                return f"{cmd} {vals}"
+        return line
 
     def _poke_cli(self) -> None:
         if self._config_serial is None or not self._config_serial.is_open:
