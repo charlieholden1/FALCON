@@ -188,15 +188,14 @@ def run_cfg_once(
         if data_ser is not None and ok:
             data_logs.extend(drain_serial(data_ser, 2.0))
     finally:
-        # Drain any last bytes before closing.
+        # Always leave the demo stopped, even when an earlier command failed.
+        config_logs.extend(stop_sensor_before_close(cfg_ser))
         if data_ser is not None:
             try:
                 data_logs.extend(drain_serial(data_ser, 0.2))
             except Exception:
                 pass
             data_ser.close()
-        if ok:
-            config_logs.extend(stop_sensor_before_close(cfg_ser))
         config_logs.extend(drain_serial(cfg_ser, 0.2))
         cfg_ser.close()
 

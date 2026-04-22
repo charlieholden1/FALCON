@@ -30,14 +30,17 @@ CameraProjection
 
 from __future__ import annotations
 
+import atexit
 import copy
 import json
 import logging
 import math
 import re
+import signal
 import struct
 import threading
 import time
+import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
@@ -121,6 +124,8 @@ _SERIAL_OPEN_DELAY_S = 0.5
 _CLI_WAKE_ATTEMPTS = 3
 _CLI_WAKE_TIMEOUT_S = 0.8
 _CLI_POST_OPEN_SETTLE_S = 1.0
+_SENSOR_STOP_TIMEOUT_S = 1.5
+_SENSOR_STOP_ATTEMPTS = 2
 PERSON_BOX_DEFAULT_WIDTH_M = 0.70
 PERSON_BOX_DEFAULT_DEPTH_M = 0.70
 PERSON_BOX_DEFAULT_HEIGHT_M = 1.80
@@ -130,6 +135,83 @@ PERSON_BOX_MIN_HEIGHT_M = 1.20
 PERSON_BOX_MAX_WIDTH_M = 1.15
 PERSON_BOX_MAX_DEPTH_M = 1.15
 PERSON_BOX_MAX_HEIGHT_M = 2.30
+
+_ACTIVE_DRIVER_LOCK = threading.RLock()
+_ACTIVE_DRIVERS: "weakref.WeakSet[Any]" = weakref.WeakSet()
+_SHUTDOWN_HOOKS_INSTALLED = False
+_SHUTDOWN_IN_PROGRESS = False
+_PREVIOUS_SIGNAL_HANDLERS: Dict[int, Any] = {}
+
+
+def _register_active_driver(driver: Any) -> None:
+    with _ACTIVE_DRIVER_LOCK:
+        _ACTIVE_DRIVERS.add(driver)
+
+
+def _unregister_active_driver(driver: Any) -> None:
+    with _ACTIVE_DRIVER_LOCK:
+        try:
+            _ACTIVE_DRIVERS.discard(driver)
+        except TypeError:
+            pass
+
+
+def _stop_active_live_drivers_at_exit() -> None:
+    """Best-effort process cleanup for normal exit, Ctrl-C, and SIGTERM."""
+
+    global _SHUTDOWN_IN_PROGRESS
+    with _ACTIVE_DRIVER_LOCK:
+        if _SHUTDOWN_IN_PROGRESS:
+            return
+        _SHUTDOWN_IN_PROGRESS = True
+        drivers = list(_ACTIVE_DRIVERS)
+
+    try:
+        for driver in drivers:
+            try:
+                driver.close()
+            except Exception as exc:
+                logger.debug("Radar shutdown cleanup failed: %s", exc)
+    finally:
+        with _ACTIVE_DRIVER_LOCK:
+            _SHUTDOWN_IN_PROGRESS = False
+
+
+def _radar_process_signal_handler(signum: int, frame: Any) -> None:
+    _stop_active_live_drivers_at_exit()
+
+    previous = _PREVIOUS_SIGNAL_HANDLERS.get(signum, signal.SIG_DFL)
+    if previous == signal.SIG_IGN:
+        return
+    if callable(previous) and previous is not _radar_process_signal_handler:
+        previous(signum, frame)
+        return
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt
+    raise SystemExit(128 + int(signum))
+
+
+def _ensure_process_shutdown_hooks() -> None:
+    global _SHUTDOWN_HOOKS_INSTALLED
+    if _SHUTDOWN_HOOKS_INSTALLED:
+        return
+    _SHUTDOWN_HOOKS_INSTALLED = True
+    atexit.register(_stop_active_live_drivers_at_exit)
+
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous = signal.getsignal(sig)
+            if previous == _radar_process_signal_handler:
+                continue
+            _PREVIOUS_SIGNAL_HANDLERS[int(sig)] = previous
+            signal.signal(sig, _radar_process_signal_handler)
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+
+_ensure_process_shutdown_hooks()
 
 
 @dataclass
@@ -738,7 +820,7 @@ def open_serial_with_retries(
     last_error: Optional[BaseException] = None
     for attempt in range(1, attempts + 1):
         try:
-            return serial.Serial(port, baudrate, timeout=timeout)
+            return _open_serial_port_safely(port, baudrate, timeout=timeout)
         except (serial.SerialException, OSError) as exc:
             last_error = exc
             if attempt == attempts:
@@ -757,6 +839,47 @@ def open_serial_with_retries(
     if isinstance(last_error, serial.SerialException):
         raise last_error
     raise serial.SerialException(str(last_error))
+
+
+def _open_serial_port_safely(
+    port: str,
+    baudrate: int,
+    *,
+    timeout: float,
+) -> "serial.Serial":
+    """Open a UART without asserting flow-control lines on TI eval boards."""
+
+    ser = serial.Serial(
+        port=None,
+        baudrate=baudrate,
+        bytesize=serial.EIGHTBITS,
+        parity=serial.PARITY_NONE,
+        stopbits=serial.STOPBITS_ONE,
+        timeout=timeout,
+        write_timeout=1.0,
+        xonxoff=False,
+        rtscts=False,
+        dsrdtr=False,
+    )
+    _set_serial_control_lines_quiet(ser)
+    try:
+        ser.exclusive = True
+    except (AttributeError, ValueError, TypeError):
+        pass
+    ser.port = port
+    ser.open()
+    _set_serial_control_lines_quiet(ser)
+    return ser
+
+
+def _set_serial_control_lines_quiet(ser: Any) -> None:
+    """Keep DTR/RTS from acting like an accidental reset/SOP signal."""
+
+    for attr in ("rts", "dtr"):
+        try:
+            setattr(ser, attr, False)
+        except Exception:
+            pass
 
 
 def wake_cli(
@@ -1501,6 +1624,7 @@ class IWR6843Driver(FrameSource):
 
         self._frame_buffer: deque[RadarFrame] = deque(maxlen=5)
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
 
         self._frame_count = 0
         self._frame_timestamps: deque[float] = deque(maxlen=20)
@@ -1632,6 +1756,7 @@ class IWR6843Driver(FrameSource):
                 self._config_baud,
                 timeout=0.1,
             )
+            _register_active_driver(self)
         except serial.SerialException as exc:
             self._connection_error = f"Failed to open config serial port: {exc}"
             logger.error(self._connection_error)
@@ -1651,7 +1776,7 @@ class IWR6843Driver(FrameSource):
         except serial.SerialException as exc:
             self._connection_error = f"Failed to open data serial port: {exc}"
             logger.error(self._connection_error)
-            self._cleanup_serial()
+            self._shutdown_serial_session()
             self._persist_session_artifacts()
             self._close_frame_debug()
             return False
@@ -1672,7 +1797,7 @@ class IWR6843Driver(FrameSource):
 
         if not self._send_config():
             logger.error("Failed to send configuration")
-            self._cleanup_serial()
+            self._shutdown_serial_session()
             self._close_frame_debug()
             self._persist_session_artifacts()
             return False
@@ -1700,24 +1825,11 @@ class IWR6843Driver(FrameSource):
     def close(self) -> None:
         """Stop the sensor and close serial connections."""
 
-        self._running = False
-
-        if self._config_serial is not None and self._config_serial.is_open:
-            try:
-                self._config_serial.write(b"sensorStop\n")
-                time.sleep(0.1)
-            except serial.SerialException:
-                pass
-
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-
-        self._cleanup_serial()
-        self._connected = False
-        self._persist_session_artifacts()
-        self._close_frame_debug()
-        logger.info("IWR6843 radar stopped")
+        with self._lifecycle_lock:
+            self._shutdown_serial_session()
+            self._persist_session_artifacts()
+            self._close_frame_debug()
+            logger.info("IWR6843 radar stopped")
 
     def get_point_cloud(self) -> List[RadarPoint]:
         """Return the latest detected radar points."""
@@ -2096,13 +2208,74 @@ class IWR6843Driver(FrameSource):
             logger.warning("Serial write error: %s", exc)
             return False
 
+    def _shutdown_serial_session(self) -> None:
+        """Stop radar streaming, stop the reader thread, and close UARTs."""
+
+        self._running = False
+        self._send_sensor_stop_best_effort()
+
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+        self._cleanup_serial()
+        self._connected = False
+
+    def _send_sensor_stop_best_effort(self) -> bool:
+        """Send sensorStop during cleanup without depending on a perfect CLI."""
+
+        if self._config_serial is None or not self._config_serial.is_open:
+            return False
+
+        saw_ack = False
+        for attempt in range(_SENSOR_STOP_ATTEMPTS):
+            try:
+                self._append_cli_log(f">> sensorStop (cleanup attempt {attempt + 1})\n")
+                self._config_serial.write(b"sensorStop\n")
+                deadline = time.time() + _SENSOR_STOP_TIMEOUT_S
+                response = b""
+                while time.time() < deadline:
+                    chunk = self._config_serial.read(self._config_serial.in_waiting or 1)
+                    if chunk:
+                        response += chunk
+                        if (
+                            b"Done" in response
+                            or b"Ignored" in response
+                            or b"Error" in response
+                            or b"mmwDemo:/>" in response
+                        ):
+                            saw_ack = True
+                            break
+                    else:
+                        time.sleep(0.01)
+                if response:
+                    self._append_cli_log(response)
+                if saw_ack:
+                    return True
+                time.sleep(0.05)
+            except (serial.SerialException, OSError) as exc:
+                logger.debug("sensorStop cleanup failed: %s", exc)
+                return False
+
+        self._append_cli_log("sensorStop cleanup: no CLI response\n")
+        return False
+
     def _cleanup_serial(self) -> None:
         if self._config_serial is not None:
-            self._config_serial.close()
+            try:
+                _set_serial_control_lines_quiet(self._config_serial)
+                self._config_serial.close()
+            except Exception:
+                pass
         if self._data_serial is not None:
-            self._data_serial.close()
+            try:
+                _set_serial_control_lines_quiet(self._data_serial)
+                self._data_serial.close()
+            except Exception:
+                pass
         self._config_serial = None
         self._data_serial = None
+        _unregister_active_driver(self)
 
     def _reader_loop(self) -> None:
         """Background thread to parse UART packets from the radar."""
@@ -2342,16 +2515,13 @@ class IWR6843Driver(FrameSource):
 
     def _parse_raw_cartesian_points(self, payload: bytes) -> List[RadarPoint]:
         points: List[RadarPoint] = []
+        tilt = self._scene_metadata.elevation_tilt_deg
         for offset in range(0, len(payload), _RAW_POINT_STRUCT.size):
             x, y, z, velocity = _RAW_POINT_STRUCT.unpack_from(payload, offset)
-            points.append(
-                RadarPoint(
-                    x=float(x),
-                    y=float(y),
-                    z=float(z),
-                    velocity=float(velocity),
-                )
-            )
+            fx, fy, fz = float(x), float(y), float(z)
+            if tilt != 0.0:
+                fx, fy, fz = self._apply_elevation_tilt(fx, fy, fz, tilt)
+            points.append(RadarPoint(x=fx, y=fy, z=fz, velocity=float(velocity)))
         return points
 
     def _parse_compressed_points(self, payload: bytes) -> Optional[List[RadarPoint]]:
@@ -2391,6 +2561,9 @@ class IWR6843Driver(FrameSource):
                 elevation_rad=elevation,
                 distance_m=distance,
             )
+            tilt = self._scene_metadata.elevation_tilt_deg
+            if tilt != 0.0:
+                x, y, z = self._apply_elevation_tilt(x, y, z, tilt)
             points.append(RadarPoint(x=x, y=y, z=z, velocity=velocity, snr=snr))
 
         return points
@@ -2428,6 +2601,27 @@ class IWR6843Driver(FrameSource):
         y = distance_m * math.cos(azimuth_rad) * cos_el
         z = distance_m * math.sin(elevation_rad)
         return float(x), float(y), float(z)
+
+    @staticmethod
+    def _apply_elevation_tilt(
+        x: float, y: float, z: float, tilt_deg: float
+    ) -> Tuple[float, float, float]:
+        """Rotate a sensor-frame point into world frame using the board elevation tilt.
+
+        Applies TI's Rx(Θ) matrix (Tracker Layer Tuning Guide, §sensorPosition):
+            [[1,   0,      0   ],
+             [0, cos(Θ), sin(Θ)],
+             [0,-sin(Θ), cos(Θ)]]
+        where positive Θ = sensor tilted downward toward the scene.
+
+        The TI tracker firmware applies this internally for track outputs, so call
+        this ONLY on raw point-cloud TLVs, never on track position data.
+        """
+        if tilt_deg == 0.0:
+            return x, y, z
+        t = math.radians(tilt_deg)
+        ct, st = math.cos(t), math.sin(t)
+        return x, y * ct + z * st, -y * st + z * ct
 
 
 class ReplayRadarSource(FrameSource):

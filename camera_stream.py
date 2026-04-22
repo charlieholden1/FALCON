@@ -16,10 +16,16 @@ get_depth_meters(depth_frame, x, y) → float | None
 from __future__ import annotations
 
 import queue
+import os
+import re
 import sys
 import threading
 import time
 from typing import Optional, Tuple
+
+if sys.platform == "linux":
+    import fcntl
+    import struct
 
 import cv2
 import numpy as np
@@ -124,6 +130,154 @@ class DualStreamCamera:
 
     # ── device discovery ────────────────────────────────────────────
 
+    _V4L2_COLOR_FORMATS = {
+        "MJPG",
+        "YUYV",
+        "UYVY",
+        "RGB3",
+        "BGR3",
+        "BA81",
+        "RGGB",
+        "GRBG",
+        "GBRG",
+        "BGGR",
+    }
+    _V4L2_DEPTH_FORMATS = {
+        "Z16 ",
+        "Y16 ",
+        "GREY",
+        "RW16",
+        "INVZ",
+        "INVI",
+    }
+
+    @staticmethod
+    def _fourcc_to_str(value: int) -> str:
+        return "".join(chr((value >> (8 * i)) & 0xFF) for i in range(4))
+
+    @staticmethod
+    def _linux_webcam_descriptors() -> list:
+        """
+        Discover Linux V4L2 nodes that are likely to work as color webcams.
+
+        RealSense and UVC devices often publish multiple /dev/videoN nodes:
+        color, depth/IR, and metadata. OpenCV emits noisy warnings when asked
+        to open the wrong ones, so use lightweight V4L2 capability/format
+        queries before the GUI builds its candidate list.
+        """
+        if sys.platform != "linux":
+            return []
+
+        video_dir = "/sys/class/video4linux"
+        try:
+            names = os.listdir(video_dir)
+        except OSError:
+            return []
+
+        devices = []
+        for name in names:
+            match = re.fullmatch(r"video(\d+)", name)
+            if match is None:
+                continue
+            index = int(match.group(1))
+            path = f"/dev/video{index}"
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                continue
+
+            try:
+                info = DualStreamCamera._query_v4l2_device(fd)
+            except OSError:
+                os.close(fd)
+                continue
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+            if not info["is_capture"] or info["is_metadata"]:
+                continue
+
+            formats = info["formats"]
+            has_color = any(fmt in DualStreamCamera._V4L2_COLOR_FORMATS for fmt in formats)
+            has_depth_only = formats and all(
+                fmt in DualStreamCamera._V4L2_DEPTH_FORMATS for fmt in formats
+            )
+            if formats and not has_color and has_depth_only:
+                continue
+
+            devices.append({
+                "label": f"Webcam {index}",
+                "type": "webcam",
+                "index": index,
+                "serial": None,
+                "_formats": formats,
+                "_has_color": has_color,
+            })
+
+        devices.sort(key=lambda d: (not d["_has_color"], d["index"]))
+        for device in devices:
+            device.pop("_formats", None)
+            device.pop("_has_color", None)
+
+        # Silently probe each V4L2 candidate to drop nodes that pass the
+        # capability filter but can't actually produce frames (e.g. RealSense
+        # metadata streams, USB-audio capture interfaces, etc.).  Stderr is
+        # redirected at the file-descriptor level so GStreamer/V4L2 driver
+        # warnings don't appear in the terminal during discovery.
+        verified: list = []
+        for device in devices:
+            if DualStreamCamera._probe_webcam_silent(device["index"]):
+                verified.append(device)
+        return verified
+
+    @staticmethod
+    def _query_v4l2_device(fd: int) -> dict:
+        VIDIOC_QUERYCAP = 0x80685600
+        VIDIOC_ENUM_FMT = 0xC0405602
+        V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
+        V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE = 9
+        V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+        V4L2_CAP_VIDEO_CAPTURE_MPLANE = 0x00001000
+        V4L2_CAP_META_CAPTURE = 0x00800000
+        V4L2_CAP_DEVICE_CAPS = 0x80000000
+
+        cap_buf = bytearray(104)
+        fcntl.ioctl(fd, VIDIOC_QUERYCAP, cap_buf, True)
+        _, _, _, _, capabilities, device_caps = struct.unpack_from(
+            "16s32s32sIII", cap_buf,
+        )
+        caps = device_caps if capabilities & V4L2_CAP_DEVICE_CAPS else capabilities
+        is_capture = bool(
+            caps & (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE)
+        )
+        is_metadata = bool(caps & V4L2_CAP_META_CAPTURE)
+
+        formats = []
+        for buffer_type in (
+            V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+        ):
+            fmt_index = 0
+            while True:
+                fmt_buf = bytearray(64)
+                struct.pack_into("II", fmt_buf, 0, fmt_index, buffer_type)
+                try:
+                    fcntl.ioctl(fd, VIDIOC_ENUM_FMT, fmt_buf, True)
+                except OSError:
+                    break
+                pixelformat = struct.unpack_from("I", fmt_buf, 44)[0]
+                formats.append(DualStreamCamera._fourcc_to_str(pixelformat))
+                fmt_index += 1
+
+        return {
+            "is_capture": is_capture,
+            "is_metadata": is_metadata,
+            "formats": formats,
+        }
+
     @staticmethod
     def discover_cameras() -> list:
         """
@@ -163,16 +317,21 @@ class DualStreamCamera:
             except Exception:
                 pass
 
-        # Avoid probing webcam indices during GUI startup because some
-        # V4L2 stacks emit noisy driver errors or leave invalid handles
-        # behind. Keep a few manual entries available as fallback.
-        for i in range(4):
-            cameras.append({
-                "label": f"Webcam {i}",
-                "type": "webcam",
-                "index": i,
-                "serial": None,
-            })
+        webcams = DualStreamCamera._linux_webcam_descriptors()
+        if not webcams:
+            # Avoid probing webcam indices during GUI startup because some
+            # V4L2 stacks emit noisy driver errors or leave invalid handles
+            # behind. Keep a few manual entries available as fallback.
+            webcams = [
+                {
+                    "label": f"Webcam {i}",
+                    "type": "webcam",
+                    "index": i,
+                    "serial": None,
+                }
+                for i in range(4)
+            ]
+        cameras.extend(webcams)
 
         return cameras
 
@@ -200,6 +359,26 @@ class DualStreamCamera:
             return bool(ok and frame is not None and frame.size > 0)
         finally:
             cap.release()
+
+    @staticmethod
+    def _probe_webcam_silent(index: int) -> bool:
+        """Like _probe_webcam_index but redirects stderr to /dev/null first.
+
+        Keeps GStreamer/V4L2 driver warnings out of the terminal when probing
+        devices that pass the capability filter but can't produce frames.
+        Only available on POSIX; falls back to the noisy version elsewhere.
+        """
+        if os.name != "posix":
+            return DualStreamCamera._probe_webcam_index(index)
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_stderr = os.dup(2)
+        try:
+            os.dup2(devnull_fd, 2)
+            return DualStreamCamera._probe_webcam_index(index)
+        finally:
+            os.dup2(saved_stderr, 2)
+            os.close(saved_stderr)
+            os.close(devnull_fd)
 
     # ── RealSense initialisation ────────────────────────────────────
 

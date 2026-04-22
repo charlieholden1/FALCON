@@ -254,16 +254,19 @@ def live_capture_command(args: argparse.Namespace) -> int:
         config_baud=args.config_baud,
         data_baud=args.data_baud,
     )
-    if not driver.start():
-        state = driver.session_state()
-        print(f"Capture failed: {state.health_verdict} - {state.health_reason}")
-        print(f"Command error: {state.last_command_error or '-'}")
-        print(f"Connection error: {state.connection_error or '-'}")
-        return 2
-
-    print(f"Capturing {args.seconds:.1f}s of live radar debug data...")
+    started = False
     interrupted = False
+    frames_path: Optional[Path] = None
     try:
+        started = driver.start()
+        if not started:
+            state = driver.session_state()
+            print(f"Capture failed: {state.health_verdict} - {state.health_reason}")
+            print(f"Command error: {state.last_command_error or '-'}")
+            print(f"Connection error: {state.connection_error or '-'}")
+            return 2
+
+        print(f"Capturing {args.seconds:.1f}s of live radar debug data...")
         end_time = time.time() + float(args.seconds)
         while time.time() < end_time:
             time.sleep(min(1.0, max(0.05, end_time - time.time())))
@@ -277,9 +280,12 @@ def live_capture_command(args: argparse.Namespace) -> int:
         print("\nCapture interrupted; saving and analyzing the frames captured so far...")
     finally:
         state = driver.session_state()
-        frames_path = Path(state.frame_debug_path) if state.frame_debug_path else None
+        if state.frame_debug_path:
+            frames_path = Path(state.frame_debug_path)
         driver.stop()
 
+    if not started:
+        return 2
     if frames_path is None or not frames_path.exists():
         print("Capture finished, but no frames.jsonl file was written.")
         return 1

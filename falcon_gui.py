@@ -15,6 +15,7 @@ in a lightweight Tkinter GUI with:
 from __future__ import annotations
 
 import glob
+import json
 import logging
 import os
 import site
@@ -24,7 +25,7 @@ import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 
 def _maybe_reexec_with_torch_libgomp() -> None:
@@ -77,14 +78,20 @@ from tracking import TrackingManager
 from camera_stream import DualStreamCamera
 from radar import CameraProjection, IWR6843Driver, MockRadar
 from radar_camera_fusion import (
+    AutoCalibrationController,
+    AutoCalibrationState,
+    CornerReflectorCalibController,
+    CornerReflectorCalibState,
     FusionEventLogger,
     FusionMode,
+    MountGeometryPrior,
     RadarCameraFusionManager,
     backproject_pixel,
     capture_calibration_sample,
     project_radar_track_bbox,
     save_calibration_samples,
     solve_calibration_auto,
+    solve_calibration_constrained,
     solve_calibration_samples,
 )
 from camera_stream import get_depth_meters
@@ -93,10 +100,22 @@ logger = logging.getLogger("falcon.gui")
 
 # Discover available cameras once at import time
 _CAMERA_LIST = DualStreamCamera.discover_cameras()
+print(
+    "[FALCON] Cameras discovered: "
+    + (
+        ", ".join(c["label"] for c in _CAMERA_LIST)
+        if _CAMERA_LIST else "none"
+    )
+)
 
 # ── Model catalogue ─────────────────────────────────────────────────
 
 MODEL_OPTIONS = {
+    "Camera Only": {
+        "backend": "none",
+        "path": None,
+        "description": "Open the live camera feed without pose detection",
+    },
     "YOLO26 Nano (Default)": {
         "backend": "yolo",
         "path": "yolo26n-pose.pt",
@@ -159,6 +178,62 @@ TRAIL_LENGTH = 10
 def _gpu_resize(frame: np.ndarray, new_w: int, new_h: int) -> np.ndarray:
     """Resize for display on CPU to avoid contending with YOLO on CUDA."""
     return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+
+class GuiDiagnosticsRecorder:
+    """Append lightweight GUI/radar/fusion snapshots to JSONL."""
+
+    def __init__(self) -> None:
+        self.path: Optional[Path] = None
+        self._handle: Optional[Any] = None
+        self.frame_count = 0
+        self.flag_counts: Dict[str, int] = {}
+
+    def open(self, path: Path | str) -> None:
+        self.close()
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("a", encoding="utf-8", buffering=1)
+        self.frame_count = 0
+        self.flag_counts = {}
+
+    def write(self, record: Dict[str, Any]) -> None:
+        if self._handle is None:
+            return
+        flags = [str(flag) for flag in record.get("flags", [])]
+        for flag in flags:
+            self.flag_counts[flag] = self.flag_counts.get(flag, 0) + 1
+        self.frame_count += 1
+        payload = dict(record)
+        payload.setdefault("timestamp", time.time())
+        self._handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            self._handle.write(
+                json.dumps(
+                    {
+                        "type": "session_end",
+                        "timestamp": time.time(),
+                        "frame_count": int(self.frame_count),
+                        "flag_counts": dict(sorted(self.flag_counts.items())),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            self._handle.flush()
+            self._handle.close()
+        finally:
+            self._handle = None
+
+
+class FusionViewMode:
+    DEBUG = "Debug"
+    PRODUCTION = "Production"
 
 
 # ── MediaPipe helper ────────────────────────────────────────────────
@@ -296,15 +371,26 @@ class VisionPipeline:
         self._radar = None               # IWR6843Driver or MockRadar
         self._radar_backup = None        # stored ref when toggled off
         self._radar_init_thread: Optional[threading.Thread] = None
+        self._radar_recovery_thread: Optional[threading.Thread] = None
+        self._radar_recovery_in_progress = False
+        self._radar_recovery_attempts = 0
         self._radar_status_message = "Radar: idle"
         self.projection: Optional[CameraProjection] = None
-        self.radar_enabled = True
+        self.radar_enabled = os.environ.get("FALCON_DISABLE_RADAR", "0") != "1"
+        self.single_person_mode = True
+        self.fusion_view_mode = FusionViewMode.PRODUCTION
         self.show_radar_overlay = True
         self.show_radar_points = True
         self.show_radar_tracks = True
         self.show_fusion_debug = True
         self._fusion_logger = FusionEventLogger()
         self.fusion = RadarCameraFusionManager(event_logger=self._fusion_logger)
+        self._gui_diagnostics = GuiDiagnosticsRecorder()
+        self.auto_calibration = AutoCalibrationController(
+            self.ensure_projection(),
+            self._fusion_logger,
+        )
+        self.corner_reflector_calib = CornerReflectorCalibController(self.ensure_projection())
         self._calibration_samples = []
         self._calibration_click_uv: Optional[tuple[float, float]] = None
         self.allow_point_cloud_calibration = False
@@ -337,6 +423,9 @@ class VisionPipeline:
         self._latest_radar_frame = None
         self._latest_depth_frame: Optional[np.ndarray] = None
         self._last_frame_shape = None
+        self._last_radar_frame_number: Optional[int] = None
+        self._last_radar_frame_seen_at = 0.0
+        self._radar_stale_since: Optional[float] = None
 
         # FPS bookkeeping
         self._fps_value = 0.0
@@ -357,6 +446,11 @@ class VisionPipeline:
         """
         cfg = MODEL_OPTIONS[model_key]
         self.backend = cfg["backend"]
+        self.model = None
+        self.mp_pose = None
+
+        if self.backend == "none":
+            return ""
 
         if self.backend == "yolo":
             try:
@@ -384,7 +478,6 @@ class VisionPipeline:
                 else:
                     self._yolo_half = False
                 
-                self.mp_pose = None
                 return ""
             except Exception as exc:
                 return f"Failed to load YOLO model: {exc}"
@@ -434,7 +527,6 @@ class VisionPipeline:
                     min_tracking_confidence=0.5,
                 )
                 self.mp_pose = PoseLandmarker.create_from_options(options)
-                self.model = None
                 return ""
             except ImportError:
                 return (
@@ -456,6 +548,11 @@ class VisionPipeline:
         # Ensure any previous camera is released first
         self.close_camera()
 
+        # Always try the selected camera first.  If it is a webcam and it
+        # fails, fall back to any other webcam in the discovered list — this
+        # lets the GUI auto-recover when the dropdown index is stale.
+        # Stderr is suppressed during fallback attempts so GStreamer/V4L2
+        # driver noise doesn't appear in the terminal.
         candidates = [cam_descriptor]
         if cam_descriptor.get("type") == "webcam":
             seen = {cam_descriptor.get("index")}
@@ -467,18 +564,31 @@ class VisionPipeline:
                 candidates.append(candidate)
                 seen.add(candidate.get("index"))
 
-        for candidate in candidates:
+        for i, candidate in enumerate(candidates):
             is_rs = candidate["type"] == "realsense"
             idx = candidate.get("index", 0) or 0
             serial = candidate.get("serial")
             label = candidate["label"]
             print(f"[FALCON] Opening camera: {label}")
 
-            self._webcam = DualStreamCamera(
-                webcam_index=idx,
-                use_realsense=is_rs,
-                realsense_serial=serial,
-            )
+            is_fallback = i > 0
+            if is_fallback and os.name == "posix":
+                devnull_fd = os.open(os.devnull, os.O_WRONLY)
+                saved_stderr = os.dup(2)
+                os.dup2(devnull_fd, 2)
+
+            try:
+                self._webcam = DualStreamCamera(
+                    webcam_index=idx,
+                    use_realsense=is_rs,
+                    realsense_serial=serial,
+                )
+            finally:
+                if is_fallback and os.name == "posix":
+                    os.dup2(saved_stderr, 2)
+                    os.close(saved_stderr)
+                    os.close(devnull_fd)
+
             if self._webcam.is_opened():
                 return True
             self.close_camera()
@@ -504,16 +614,32 @@ class VisionPipeline:
         self._fusion_run_dir = root / f"fusion_{timestamp}_{suffix}"
         self._fusion_run_dir.mkdir(parents=True, exist_ok=True)
         self._fusion_logger.open(self._fusion_run_dir / "fusion_events.jsonl")
+        self._gui_diagnostics.open(self._fusion_run_dir / "gui_diagnostics.jsonl")
         self.fusion.reset()
+
+    def _ensure_calibration_record_dir(self) -> Path:
+        if self._fusion_run_dir is not None:
+            return self._fusion_run_dir
+        root = Path("diagnostics_runs")
+        root.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        suffix = f"{int((time.time() % 1.0) * 1000):03d}"
+        self._fusion_run_dir = root / f"auto_calibration_{timestamp}_{suffix}"
+        self._fusion_run_dir.mkdir(parents=True, exist_ok=True)
+        return self._fusion_run_dir
 
     def _stop_fusion_logging(self) -> None:
         self._fusion_logger.close()
+        self._gui_diagnostics.close()
 
     # ── start / stop ─────────────────────────────────────────────────
 
     def _init_radar(self) -> None:
         """Initialize the projection immediately and radar asynchronously."""
         self._init_projection_from_camera()
+        if not self.radar_enabled:
+            self._radar_status_message = "Radar: disabled by FALCON_DISABLE_RADAR=1"
+            return
         self._radar_status_message = "Radar: scanning..."
         self._radar_init_thread = threading.Thread(
             target=self._init_radar_worker,
@@ -590,10 +716,50 @@ class VisionPipeline:
         )
         return True
 
+    def load_mount_geometry_prior(self) -> MountGeometryPrior:
+        return MountGeometryPrior.load()
+
+    def save_mount_geometry_prior(self, prior: MountGeometryPrior) -> None:
+        prior.save()
+
+    def seed_calibration_prior(self) -> bool:
+        """Seed projection from the measured radar/camera mount geometry."""
+        prior = MountGeometryPrior.load()
+        seeded_intrinsics = self.apply_camera_intrinsics_guess()
+        self.ensure_projection().update(
+            tx=prior.tx_m,
+            ty=prior.ty_m,
+            tz=prior.tz_m,
+            yaw_deg=prior.yaw_deg,
+            pitch_deg=prior.pitch_deg,
+            roll_deg=prior.roll_deg,
+        )
+        return seeded_intrinsics
+
+    def _seeded_calibration_prior_projection(self) -> tuple[CameraProjection, bool]:
+        """Return a non-live solver projection seeded from mount geometry."""
+        prior = MountGeometryPrior.load()
+        K = self._camera_intrinsics_from_open_camera()
+        seeded_intrinsics = K is not None
+        if K is None:
+            K = self.ensure_projection().K.copy()
+        projection = CameraProjection(K=K)
+        projection.update(
+            tx=prior.tx_m,
+            ty=prior.ty_m,
+            tz=prior.tz_m,
+            yaw_deg=prior.yaw_deg,
+            pitch_deg=prior.pitch_deg,
+            roll_deg=prior.roll_deg,
+        )
+        return projection, seeded_intrinsics
+
     def _init_projection_from_camera(self) -> None:
         """Build the camera projection from the current camera intrinsics."""
         K = self._camera_intrinsics_from_open_camera()
         self.projection = CameraProjection(K=K)
+        self.auto_calibration.projection = self.projection
+        self.seed_calibration_prior()
         calib_path = Path(CameraProjection.DEFAULT_PATH)
         if calib_path.exists():
             try:
@@ -666,57 +832,113 @@ class VisionPipeline:
         return []
 
     def _init_radar_worker(self) -> None:
-        ports = self._discover_radar_ports()
-        if len(ports) < 2:
-            self._radar = None
-            self._radar_backup = None
-            self._radar_status_message = "Radar: not found"
-            logger.info("No TI radar serial pair detected")
-            return
-
-        # If discovery returned a stable XDS110 mapping, trust it first and
-        # avoid the noisy reversed-order retry unless the first attempt fails
-        # after opening successfully but never produces frames.
-        attempted_pairs = [(ports[0], ports[1])]
-        if not (ports[0].endswith("ttyACM0") and ports[1].endswith("ttyACM1")):
-            attempted_pairs.append((ports[1], ports[0]))
-
-        for config_port, data_port in attempted_pairs:
-            logger.info("Trying radar ports config=%s data=%s", config_port, data_port)
-            self._radar_status_message = f"Radar: opening {config_port} {data_port}"
-            driver = IWR6843Driver(
-                config_port=config_port,
-                data_port=data_port,
-                config_path=self._preferred_radar_cfg(),
-            )
-            if not driver.open():
-                logger.warning("Radar open failed for config=%s data=%s", config_port, data_port)
-                continue
-
-            if driver.wait_for_frame(timeout_s=6.0):
-                logger.info("IWR6843 radar connected on config=%s data=%s", config_port, data_port)
-                self._radar = driver
-                self._radar_backup = driver
-                self._radar_status_message = f"Radar: connected {config_port} {data_port}"
+        try:
+            ports = self._discover_radar_ports()
+            if len(ports) < 2:
+                self._radar = None
+                self._radar_backup = None
+                self._radar_status_message = "Radar: not found"
+                logger.info("No TI radar serial pair detected")
                 return
 
-            logger.warning(
-                "Radar produced no frames on config=%s data=%s; trying next ordering",
-                config_port,
-                data_port,
-            )
-            diag = driver.diagnostics
-            self._radar_status_message = (
-                f"Radar: no frames cfg={config_port} data={data_port} "
-                f"cmd={diag.get('last_command_error', '')} "
-                f"rx={diag.get('rx_bytes', 0)} magic={diag.get('magic_hits', 0)}"
-            ).strip()
-            driver.close()
+            # If discovery returned a stable XDS110 mapping, trust it first and
+            # avoid the noisy reversed-order retry unless the first attempt fails
+            # after opening successfully but never produces frames.
+            attempted_pairs = [(ports[0], ports[1])]
+            if not (ports[0].endswith("ttyACM0") and ports[1].endswith("ttyACM1")):
+                attempted_pairs.append((ports[1], ports[0]))
 
-        self._radar = None
-        self._radar_backup = None
-        if not self._radar_status_message.startswith("Radar: no frames"):
-            self._radar_status_message = "Radar: no frames"
+            for config_port, data_port in attempted_pairs:
+                logger.info("Trying radar ports config=%s data=%s", config_port, data_port)
+                self._radar_status_message = f"Radar: opening {config_port} {data_port}"
+                driver = IWR6843Driver(
+                    config_port=config_port,
+                    data_port=data_port,
+                    config_path=self._preferred_radar_cfg(),
+                )
+                if not driver.open():
+                    logger.warning("Radar open failed for config=%s data=%s", config_port, data_port)
+                    continue
+
+                if driver.wait_for_frame(timeout_s=6.0):
+                    logger.info("IWR6843 radar connected on config=%s data=%s", config_port, data_port)
+                    self._radar = driver
+                    self._radar_backup = driver
+                    self._radar_status_message = f"Radar: connected {config_port} {data_port}"
+                    return
+
+                logger.warning(
+                    "Radar produced no frames on config=%s data=%s; trying next ordering",
+                    config_port,
+                    data_port,
+                )
+                diag = driver.diagnostics
+                self._radar_status_message = (
+                    f"Radar: no frames cfg={config_port} data={data_port} "
+                    f"cmd={diag.get('last_command_error', '')} "
+                    f"rx={diag.get('rx_bytes', 0)} magic={diag.get('magic_hits', 0)}"
+                ).strip()
+                driver.close()
+
+            self._radar = None
+            self._radar_backup = None
+            if not self._radar_status_message.startswith("Radar: no frames"):
+                self._radar_status_message = "Radar: no frames"
+        finally:
+            if threading.current_thread() is self._radar_init_thread:
+                self._radar_init_thread = None
+
+    def _schedule_radar_recovery(self, reason: str) -> None:
+        if not self.radar_enabled:
+            return
+        if self._radar_recovery_in_progress:
+            return
+        if self._radar_init_thread is not None and self._radar_init_thread.is_alive():
+            return
+        self._radar_recovery_in_progress = True
+        self._radar_recovery_attempts += 1
+        self._radar_status_message = f"Radar: recovering ({reason})"
+        self._fusion_logger.write(
+            "radar_recovery_start",
+            {
+                "reason": str(reason),
+                "attempt": int(self._radar_recovery_attempts),
+            },
+        )
+        self._radar_recovery_thread = threading.Thread(
+            target=self._recover_radar_worker,
+            args=(reason,),
+            daemon=True,
+            name="radar-recovery",
+        )
+        self._radar_recovery_thread.start()
+
+    def _recover_radar_worker(self, reason: str) -> None:
+        try:
+            driver = self._radar_backup if self._radar_backup is not None else self._radar
+            if driver is not None:
+                try:
+                    driver.close()
+                except Exception as exc:
+                    logger.warning("Radar close during recovery failed: %s", exc)
+            self._radar = None
+            self._radar_backup = None
+            self._latest_radar_frame = None
+            self._last_radar_frame_number = None
+            self._last_radar_frame_seen_at = 0.0
+            self._radar_stale_since = None
+            self._init_radar_worker()
+            self._fusion_logger.write(
+                "radar_recovery_done",
+                {
+                    "reason": str(reason),
+                    "attempt": int(self._radar_recovery_attempts),
+                    "status": str(self._radar_status_message),
+                },
+            )
+        finally:
+            self._radar_recovery_in_progress = False
+            self._radar_recovery_thread = None
 
     def toggle_radar(self, enabled: bool) -> None:
         """Enable or disable radar fusion at runtime."""
@@ -730,7 +952,7 @@ class VisionPipeline:
         self._running = True
         self._start_fusion_logging()
 
-        # Init radar after camera is open
+        # Init projection after camera is open; init radar unless safe mode disabled it.
         self._init_radar()
 
         self.tracker = TrackingManager(
@@ -755,6 +977,7 @@ class VisionPipeline:
 
     def stop(self):
         self._running = False
+        self.auto_calibration.stop()
         if self._thread is not None:
             self._thread.join(timeout=3.0)
             self._thread = None
@@ -771,6 +994,9 @@ class VisionPipeline:
             self._latest_tracks = []
             self._latest_radar_frame = None
             self._latest_depth_frame = None
+        self._last_radar_frame_number = None
+        self._last_radar_frame_seen_at = 0.0
+        self._radar_stale_since = None
 
     @property
     def running(self) -> bool:
@@ -821,6 +1047,220 @@ class VisionPipeline:
             return 0.0
         diagnostics = getattr(radar, "diagnostics", {})
         return float(diagnostics.get("fps", 0.0) or 0.0)
+
+    def _radar_frame_age_s(self, radar_frame, *, now: Optional[float] = None) -> Optional[float]:
+        if radar_frame is None:
+            return None
+        ref = time.time() if now is None else float(now)
+        timestamp = float(
+            getattr(radar_frame, "timestamp", 0.0)
+            or getattr(radar_frame, "source_timestamp", 0.0)
+            or 0.0
+        )
+        if timestamp <= 0.0:
+            return None
+        return max(0.0, ref - timestamp)
+
+    def _update_radar_runtime_state(self, radar_frame, *, now: float) -> None:
+        if radar_frame is not None:
+            frame_number = int(getattr(radar_frame, "frame_number", -1))
+            frame_age = self._radar_frame_age_s(radar_frame, now=now)
+            if frame_age is None or frame_age <= max(self.fusion.config.stale_radar_frame_s, 0.6):
+                if frame_number != self._last_radar_frame_number:
+                    self._last_radar_frame_number = frame_number
+                    self._last_radar_frame_seen_at = now
+                self._radar_stale_since = None
+                return
+
+        driver_present = (self._radar_backup if self._radar_backup is not None else self._radar) is not None
+        if not self.radar_enabled or not driver_present:
+            self._radar_stale_since = None
+            return
+
+        if self._radar_stale_since is None:
+            self._radar_stale_since = now
+        stale_for = now - self._radar_stale_since
+        if stale_for >= 2.5:
+            self._schedule_radar_recovery("stale or missing frames")
+
+    def _track_priority(self, track) -> float:
+        bbox = np.asarray(getattr(track, "bbox", np.zeros(4, dtype=np.float32)), dtype=np.float64).reshape(4)
+        area = max(float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])), 1.0)
+        visible = 0.0
+        keypoints = getattr(track, "keypoints", None)
+        if keypoints is not None:
+            visible = float(np.sum(np.asarray(keypoints)[:, 2] >= 0.35)) / 17.0
+        return (
+            float(getattr(track, "detection_conf", 0.0) or 0.0) * 1.6
+            + visible * 0.6
+            + min(float(getattr(track, "total_frames_tracked", 0)) / 20.0, 1.0) * 0.5
+            + min(area / 30000.0, 1.0) * 0.15
+            + (0.9 if bool(getattr(track, "using_radar", False)) else 0.0)
+            + float(getattr(track, "radar_confidence", 0.0) or 0.0) * 0.5
+            - float(getattr(track, "frames_since_detection", 0)) * 0.25
+            - (0.25 if bool(getattr(track, "is_predicted", False)) else 0.0)
+        )
+
+    def _primary_track(self, tracks) -> Optional[Any]:
+        if not tracks:
+            return None
+        return max(tracks, key=self._track_priority)
+
+    def _filter_single_person_detections(self, det_boxes, det_confs, det_keypoints):
+        if not self.single_person_mode or len(det_boxes) <= 1:
+            return det_boxes, det_confs, det_keypoints
+
+        reference_track = self._primary_track(getattr(self.tracker, "tracks", []))
+        reference_center = None if reference_track is None else np.asarray(reference_track.center, dtype=np.float64)
+        best_idx = 0
+        best_score = -float("inf")
+        for idx, bbox in enumerate(det_boxes):
+            box = np.asarray(bbox, dtype=np.float64).reshape(4)
+            width = max(float(box[2] - box[0]), 1.0)
+            height = max(float(box[3] - box[1]), 1.0)
+            area_score = min((width * height) / 30000.0, 1.0)
+            visible_score = 0.0
+            if det_keypoints is not None and idx < len(det_keypoints):
+                visible_score = float(np.sum(np.asarray(det_keypoints[idx])[:, 2] >= 0.35)) / 17.0
+            center_penalty = 0.0
+            if reference_center is not None:
+                center = np.array([(box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5], dtype=np.float64)
+                center_penalty = min(float(np.linalg.norm(center - reference_center)) / 500.0, 1.0)
+            score = (
+                float(det_confs[idx]) * 1.8
+                + visible_score * 0.7
+                + area_score * 0.2
+                - center_penalty * 0.8
+            )
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        filtered_boxes = det_boxes[best_idx : best_idx + 1]
+        filtered_confs = det_confs[best_idx : best_idx + 1]
+        filtered_keypoints = None if det_keypoints is None else det_keypoints[best_idx : best_idx + 1]
+        return filtered_boxes, filtered_confs, filtered_keypoints
+
+    def _enforce_single_person_tracks(self, tracks):
+        if not self.single_person_mode or len(tracks) <= 1:
+            return tracks
+        primary = self._primary_track(tracks)
+        if primary is None:
+            return tracks
+        self.tracker.tracks = [primary]
+        return [primary]
+
+    def _visible_radar_tracks(self, radar_frame, tracks=None):
+        if radar_frame is None or not radar_frame.tracks:
+            return []
+        if not self.single_person_mode or len(radar_frame.tracks) <= 1:
+            return list(radar_frame.tracks)
+
+        linked_id = None
+        if tracks:
+            primary = self._primary_track(tracks)
+            linked_id = None if primary is None else getattr(primary, "radar_track_id", None)
+        if linked_id is not None:
+            for radar_track in radar_frame.tracks:
+                if int(radar_track.track_id) == int(linked_id):
+                    return [radar_track]
+        best = max(
+            radar_frame.tracks,
+            key=lambda track: (
+                float(getattr(track, "confidence", 0.0) or 0.0),
+                len(getattr(track, "associated_point_indexes", []) or []),
+            ),
+        )
+        return [best]
+
+    def _diagnostic_flags(self, tracks, radar_frame, *, now: float) -> List[str]:
+        flags: List[str] = []
+        snapshot = self.fusion.debug_snapshot
+        if radar_frame is None:
+            flags.append("no_radar_frame")
+        else:
+            frame_age = self._radar_frame_age_s(radar_frame, now=now)
+            if frame_age is not None and frame_age > self.fusion.config.stale_radar_frame_s:
+                flags.append("radar_stale")
+            if getattr(radar_frame, "presence", None) not in (None, 0) and len(radar_frame.tracks) == 0:
+                flags.append("presence_without_track")
+            if len(getattr(radar_frame, "points", []) or []) > 0 and len(radar_frame.tracks) == 0:
+                flags.append("points_without_track")
+            if len(radar_frame.tracks) > 1:
+                flags.append("multiple_radar_tracks_raw")
+        if snapshot.duplicate_tracks_suppressed:
+            flags.append("duplicate_radar_tracks_suppressed")
+        if snapshot.ambiguous_radar_frames:
+            flags.append("ambiguous_radar_candidates")
+        if self._radar_recovery_in_progress:
+            flags.append("radar_recovering")
+        primary = self._primary_track(tracks)
+        if primary is not None:
+            if (
+                bool(getattr(primary, "using_radar", False))
+                and int(getattr(primary, "frames_since_detection", 0)) == 0
+                and float(getattr(primary, "detection_conf", 0.0) or 0.0) >= self.fusion.config.strong_detection_conf
+                and getattr(primary, "occlusion_state", None) == OcclusionState.VISIBLE
+            ):
+                flags.append("radar_only_while_camera_healthy")
+        return sorted(set(flags))
+
+    def _record_gui_diagnostics(self, tracks, radar_frame, *, now: float) -> None:
+        if self._gui_diagnostics.path is None:
+            return
+        primary = self._primary_track(tracks)
+        snapshot = self.fusion.debug_snapshot
+        visible_radar_tracks = self._visible_radar_tracks(radar_frame, tracks=tracks)
+        frame_age = self._radar_frame_age_s(radar_frame, now=now)
+        record: Dict[str, Any] = {
+            "type": "frame",
+            "timestamp": float(now),
+            "gui_fps": float(self._fps_value),
+            "radar_fps": float(self.radar_fps()),
+            "fusion_view_mode": str(self.fusion_view_mode),
+            "radar_status": str(self._radar_status_message),
+            "radar_recovery_attempts": int(self._radar_recovery_attempts),
+            "fusion": {
+                "mode_counts": dict(snapshot.mode_counts),
+                "last_event": str(snapshot.last_event),
+                "radar_track_count_raw": int(snapshot.radar_track_count_raw),
+                "radar_track_count_filtered": int(snapshot.radar_track_count),
+                "duplicate_tracks_suppressed": int(snapshot.duplicate_tracks_suppressed),
+                "ambiguous_radar_frames": int(snapshot.ambiguous_radar_frames),
+            },
+            "radar": {
+                "frame_number": None if radar_frame is None else int(radar_frame.frame_number),
+                "frame_age_s": None if frame_age is None else round(float(frame_age), 3),
+                "point_count": 0 if radar_frame is None else len(radar_frame.points),
+                "track_count_raw": 0 if radar_frame is None else len(radar_frame.tracks),
+                "track_count_visible": len(visible_radar_tracks),
+                "presence": None if radar_frame is None else getattr(radar_frame, "presence", None),
+                "visible_track_ids": [int(track.track_id) for track in visible_radar_tracks],
+            },
+            "camera": {
+                "track_count": len(tracks),
+            },
+            "flags": self._diagnostic_flags(tracks, radar_frame, now=now),
+        }
+        if primary is not None:
+            bbox = np.asarray(primary.bbox, dtype=np.float64).reshape(4)
+            record["camera"]["primary_track"] = {
+                "track_id": int(getattr(primary, "track_id", -1)),
+                "bbox": [round(float(value), 1) for value in bbox],
+                "detection_conf": round(float(getattr(primary, "detection_conf", 0.0) or 0.0), 3),
+                "frames_since_detection": int(getattr(primary, "frames_since_detection", 0)),
+                "is_predicted": bool(getattr(primary, "is_predicted", False)),
+                "occlusion_state": getattr(getattr(primary, "occlusion_state", None), "label", str(getattr(primary, "occlusion_state", ""))),
+                "fusion_mode": str(getattr(primary, "fusion_mode", "")),
+                "using_radar": bool(getattr(primary, "using_radar", False)),
+                "radar_track_id": getattr(primary, "radar_track_id", None),
+                "radar_confidence": round(float(getattr(primary, "radar_confidence", 0.0) or 0.0), 3),
+                "degraded_camera_frames": int(getattr(primary, "degraded_camera_frames", 0)),
+                "blocked_camera_frames": int(getattr(primary, "blocked_camera_frames", 0)),
+                "radar_link_stable_frames": int(getattr(primary, "radar_link_stable_frames", 0)),
+                "radar_candidate_count": int(getattr(primary, "radar_candidate_count", 0)),
+            }
+        self._gui_diagnostics.write(record)
 
     def capture_calibration_sample(self) -> str:
         with self._lock:
@@ -885,6 +1325,62 @@ class VisionPipeline:
         prefix = "Seeded intrinsics from live camera. " if seeded_intrinsics else ""
         return prefix + result.message
 
+    def auto_calibration_start(self) -> str:
+        solver_projection, seeded_intrinsics = self._seeded_calibration_prior_projection()
+        self.auto_calibration.projection = self.ensure_projection()
+        record_path = self._ensure_calibration_record_dir() / "auto_calibration_session.jsonl"
+        status = self.auto_calibration.start(
+            solver_projection=solver_projection,
+            record_path=record_path,
+        )
+        prefix = "Seeded intrinsics and mount prior. " if seeded_intrinsics else "Seeded mount prior. "
+        return prefix + status.progress_text() + f" Recording: {record_path}"
+
+    def auto_calibration_stop(self) -> str:
+        return self.auto_calibration.stop().progress_text()
+
+    def auto_calibration_solve_now(self) -> str:
+        status = self.auto_calibration.solve_now()
+        return status.progress_text()
+
+    def auto_calibration_status(self):
+        return self.auto_calibration.status
+
+    # ── Corner Reflector Calibration ────────────────────────────────────────
+
+    def corner_reflector_start(self) -> str:
+        self.corner_reflector_calib._projection = self.ensure_projection()
+        return self.corner_reflector_calib.start()
+
+    def corner_reflector_capture(self) -> str:
+        if self._calibration_click_uv is None:
+            return "Click the reflector in the video first."
+        radar_frame = self._latest_radar_frame
+        depth_frame = self._latest_depth_frame
+        ok, msg = self.corner_reflector_calib.capture_position(
+            radar_frame, depth_frame, self._calibration_click_uv
+        )
+        if ok:
+            self._calibration_click_uv = None
+        return msg
+
+    def corner_reflector_solve(self) -> str:
+        result = self.corner_reflector_calib.solve()
+        if result.ok:
+            self.ensure_projection().update(**result.params)
+        return result.message
+
+    def corner_reflector_sample_count(self) -> int:
+        return self.corner_reflector_calib.sample_count
+
+    def corner_reflector_status(self) -> str:
+        return self.corner_reflector_calib.status
+
+    def corner_reflector_last_snr(self) -> Optional[float]:
+        return self.corner_reflector_calib.last_snr_peak
+
+    # ────────────────────────────────────────────────────────────────────────
+
     def calibration_sample_count(self) -> int:
         return len(self._calibration_samples)
 
@@ -918,8 +1414,16 @@ class VisionPipeline:
         if frame is not None and frame.tracks:
             first = frame.tracks[0]
             track_hint = f" R{first.track_id}=({first.x:.1f},{first.y:.1f},{first.z:.1f})"
+        frame_age = self._radar_frame_age_s(frame)
         if last_cmd_error:
             return f"Radar cmd error: {last_cmd_error}"
+        if self._radar_recovery_in_progress:
+            return f"Radar: recovering attempt {self._radar_recovery_attempts}  {self._radar_status_message}"
+        if frame_age is not None and frame_age > self.fusion.config.stale_radar_frame_s:
+            return (
+                f"Radar: stale {frame_age:.2f}s  {len(points)} pts {track_count} tracks{track_hint}  "
+                f"frames {frames}  fps {fps:.1f}"
+            )
         if last_error:
             return (
                 f"Radar: {len(points)} pts {track_count} tracks{track_hint}  frames {frames}  "
@@ -965,6 +1469,7 @@ class VisionPipeline:
                     det_boxes, det_keypoints, det_confs,
                     frame=frame, depth_frame=depth_frame,
                 )
+                tracks = self._enforce_single_person_tracks(tracks)
                 track_t1 = time.time()
 
                 # ── adaptive skip-rate adjustment ────────────────────
@@ -984,11 +1489,14 @@ class VisionPipeline:
                 # ── skipped frame: Kalman propagate only ─────────────
                 det_t0 = det_t1 = time.time()
                 tracks = self.tracker.propagate_only()
+                tracks = self._enforce_single_person_tracks(tracks)
                 track_t1 = time.time()
 
             # ── radar-camera fusion ─────────────────────────────────
             fusion_t0 = time.time()
+            now = time.time()
             radar_frame = self.radar_frame() if self.radar_enabled else None
+            self._update_radar_runtime_state(radar_frame, now=now)
             if self.radar_enabled and self.projection is not None:
                 tracks = self.fusion.update(
                     tracks,
@@ -997,6 +1505,7 @@ class VisionPipeline:
                     frame_shape=frame.shape,
                     gui_fps=self._fps_value,
                     radar_fps=self.radar_fps(),
+                    now=now,
                 )
             else:
                 tracks = self.fusion.update(
@@ -1006,7 +1515,17 @@ class VisionPipeline:
                     frame_shape=frame.shape,
                     gui_fps=self._fps_value,
                     radar_fps=0.0,
+                    now=now,
                 )
+            tracks = self._enforce_single_person_tracks(tracks)
+            self.auto_calibration.update(
+                tracks,
+                radar_frame,
+                depth_frame,
+                frame.shape,
+                now=now,
+            )
+            self._record_gui_diagnostics(tracks, radar_frame, now=now)
             fusion_t1 = time.time()
 
             # ── annotate ─────────────────────────────────────────────
@@ -1088,7 +1607,7 @@ class VisionPipeline:
                     .float().contiguous().cpu().numpy()
                 )
 
-        return det_boxes, det_confs, det_keypoints
+        return self._filter_single_person_detections(det_boxes, det_confs, det_keypoints)
 
     def _detect_mediapipe(self, frame, w, h):
         import mediapipe as mp
@@ -1111,7 +1630,7 @@ class VisionPipeline:
         det_confs = np.array([avg_vis])
         det_keypoints = kp.reshape(1, 17, 3)
 
-        return det_boxes, det_confs, det_keypoints
+        return self._filter_single_person_detections(det_boxes, det_confs, det_keypoints)
 
     # ── annotation ───────────────────────────────────────────────────
 
@@ -1122,11 +1641,15 @@ class VisionPipeline:
         n_radar_only = 0
         n_depth = 0
         h_frame, w_frame = vis.shape[:2]
+        debug_view = self.fusion_view_mode == FusionViewMode.DEBUG
+        production_view = self.fusion_view_mode == FusionViewMode.PRODUCTION
 
         for t in tracks:
             fusion_mode = str(getattr(t, "fusion_mode", FusionMode.CAMERA_LOCKED.value))
             radar_only = fusion_mode == FusionMode.RADAR_ONLY.value or bool(getattr(t, "using_radar", False))
             colour = (0, 165, 255) if radar_only else t.occlusion_state.colour_bgr
+            if production_view and radar_only:
+                colour = (80, 220, 140)
             x1, y1, x2, y2 = t.bbox.astype(int)
             x1, x2 = max(0, min(x1, w_frame - 1)), max(0, min(x2, w_frame - 1))
             y1, y2 = max(0, min(y1, h_frame - 1)), max(0, min(y2, h_frame - 1))
@@ -1135,13 +1658,19 @@ class VisionPipeline:
             _draw_trail(vis, t.bbox_history, colour)
 
             if radar_only:
-                cv2.rectangle(vis, (x1, y1), (x2, y2), colour, 3)
-                if x2 - x1 > 12 and y2 - y1 > 12:
-                    cv2.rectangle(vis, (x1 + 4, y1 + 4), (x2 - 4, y2 - 4), colour, 1)
-                label = f"Person #{t.track_id} RADAR ONLY"
+                if production_view:
+                    if self.show_skeleton and t.keypoints is not None:
+                        _draw_skeleton(vis, t.keypoints, colour, conf_thresh=0.15)
+                    cv2.rectangle(vis, (x1, y1), (x2, y2), colour, 1)
+                    label = f"Person #{t.track_id}"
+                else:
+                    cv2.rectangle(vis, (x1, y1), (x2, y2), colour, 3)
+                    if x2 - x1 > 12 and y2 - y1 > 12:
+                        cv2.rectangle(vis, (x1 + 4, y1 + 4), (x2 - 4, y2 - 4), colour, 1)
+                    label = f"Person #{t.track_id} RADAR ONLY"
+                    if self.show_skeleton and t.keypoints is not None:
+                        _draw_skeleton(vis, t.keypoints, colour, conf_thresh=0.15)
                 n_radar_only += 1
-                if self.show_skeleton and t.keypoints is not None:
-                    _draw_skeleton(vis, t.keypoints, colour, conf_thresh=0.15)
 
             elif t.is_predicted:
                 if self.show_predictions:
@@ -1175,10 +1704,13 @@ class VisionPipeline:
                 occ_label += f"  [{t.z_depth_meters:.2f}m]"
                 n_depth += 1
             if getattr(t, 'using_radar', False):
-                occ_label += (
-                    f" [RADAR {t.radar_confidence:.0%}"
-                    f" ID {getattr(t, 'radar_track_id', '-')}]"
-                )
+                if production_view:
+                    occ_label += " [ESTIMATED]"
+                else:
+                    occ_label += (
+                        f" [RADAR {t.radar_confidence:.0%}"
+                        f" ID {getattr(t, 'radar_track_id', '-')}]"
+                    )
             if fusion_mode not in (FusionMode.CAMERA_LOCKED.value, FusionMode.RADAR_ONLY.value):
                 occ_label += f" [{fusion_mode}]"
             cv2.putText(vis, label, (x1, y1 - 22),
@@ -1195,16 +1727,18 @@ class VisionPipeline:
 
         radar_points = []
         radar_frame = self.radar_frame() if self.show_radar_overlay and self.projection is not None else None
-        radar_track_count = 0 if radar_frame is None else len(radar_frame.tracks)
+        visible_radar_tracks = self._visible_radar_tracks(radar_frame, tracks=tracks)
+        radar_track_count = len(visible_radar_tracks)
+        radar_track_count_raw = 0 if radar_frame is None else len(radar_frame.tracks)
         radar_first_track = ""
-        if radar_frame is not None and radar_frame.tracks:
-            first = radar_frame.tracks[0]
+        if visible_radar_tracks:
+            first = visible_radar_tracks[0]
             radar_first_track = f" R{first.track_id}=({first.x:.1f},{first.y:.1f},{first.z:.1f})"
-        if self.show_radar_overlay and self.show_radar_points and self.projection is not None:
+        if debug_view and self.show_radar_overlay and self.show_radar_points and self.projection is not None:
             radar_points = self.radar_points()
             self._draw_radar_overlay(vis, radar_points)
-        if self.show_radar_overlay and self.show_radar_tracks and self.projection is not None and radar_frame is not None:
-            self._draw_radar_track_overlay(vis, radar_frame.tracks)
+        if debug_view and self.show_radar_overlay and self.show_radar_tracks and self.projection is not None and radar_frame is not None:
+            self._draw_radar_track_overlay(vis, visible_radar_tracks)
 
         fusion_status = self.fusion.status_text()
         self._draw_calibration_click(vis)
@@ -1213,13 +1747,16 @@ class VisionPipeline:
         overlay_lines = [
             f"FPS: {self._fps_value:.1f}",
             f"Tracked: {len(tracks)}",
+            f"View: {self.fusion_view_mode}",
             f"Occluded: {n_occluded}",
             f"Predicted: {n_predicted}",
             f"Radar Only: {n_radar_only}",
             f"Recovered: {n_recovered}",
             f"Depth: {n_depth}/{len(tracks)}",
             f"Radar Points: {len(radar_points)}",
-            f"Radar Tracks: {radar_track_count}{radar_first_track}",
+            f"Radar Tracks: {radar_track_count}"
+            + (f" raw:{radar_track_count_raw}" if radar_track_count_raw != radar_track_count else "")
+            + radar_first_track,
             f"Timing ms C:{self._timing['cam_ms']:.0f} D:{self._timing['detect_ms']:.0f} T:{self._timing['track_ms']:.0f} F:{self._timing['fusion_ms']:.0f} R:{self._timing['draw_ms']:.0f}",
         ]
         if self.show_fusion_debug:
@@ -1392,20 +1929,37 @@ class RadarCalibrationWindow:
         self.window = tk.Toplevel(root)
         self.window.title("Radar Calibration")
         self.window.configure(bg="#1e1e2e")
-        self.window.geometry("720x520")
+        self.window.geometry("780x640")
         self.window.resizable(False, True)
+        style = ttk.Style(self.window)
+        style.configure("CalibHero.TLabel", background="#1e1e2e", foreground="#f5e0dc",
+                        font=("Segoe UI", 18, "bold"))
+        style.configure("CalibInstruction.TLabel", background="#1e1e2e", foreground="#a6e3a1",
+                        font=("Segoe UI", 14, "bold"))
+        style.configure("CalibDetail.TLabel", background="#1e1e2e", foreground="#cdd6f4",
+                        font=("Segoe UI", 11))
 
         self.status_var = tk.StringVar(
             value=f"Save path: {CameraProjection.DEFAULT_PATH}"
+        )
+        self.auto_status_var = tk.StringVar(
+            value=self.pipeline.auto_calibration_status().progress_text()
+        )
+        self.auto_instruction_var = tk.StringVar(
+            value="Press Auto Calibrate. Keep exactly one person visible and walk slowly."
         )
         self._vars = {}
         self._suspend_callbacks = False
         self._advanced_visible = False
         self._advanced_grid = None
         self._advanced_button = None
+        self._last_auto_saved_path = ""
         self.allow_point_cloud_var = tk.BooleanVar(
             value=bool(self.pipeline.allow_point_cloud_calibration)
         )
+        # Mount geometry prior entries (inches, driving m display).
+        self._mount_in_vars: dict[str, tk.StringVar] = {}
+        self._mount_m_vars: dict[str, tk.StringVar] = {}
 
         container = ttk.Frame(self.window)
         container.pack(fill="both", expand=True, padx=10, pady=10)
@@ -1417,14 +1971,43 @@ class RadarCalibrationWindow:
         ).pack(anchor="w")
         ttk.Label(
             container,
+            textvariable=self.auto_instruction_var,
+            style="CalibHero.TLabel",
+            wraplength=720,
+        ).pack(anchor="w", pady=(4, 8))
+        ttk.Label(
+            container,
             text=(
-                "Best path: start the camera and radar, stand still, click your "
-                "torso center in the video, then capture a sample. Repeat at "
-                "5-9 different spots, solve, and save."
+                "One person only. Shoulders and hips must be visible. "
+                "Walk slowly and smoothly so the radar keeps a track, then move to a clearly different "
+                "near / middle / far and left / center / right spot. "
+                "Solve Calibration will solve auto samples when no manual samples are queued."
             ),
-            style="Status.TLabel",
-            wraplength=660,
+            style="CalibDetail.TLabel",
+            wraplength=720,
         ).pack(anchor="w", pady=(0, 10))
+
+        # ── Mount Geometry Prior panel ──────────────────────────────────────
+        self._build_mount_prior_panel(container)
+
+        # ── Guided Body Calibration panel ──────────────────────────────────
+        self._reflector_status_var = tk.StringVar(value="Idle.")
+        self._reflector_sample_var = tk.StringVar(value="Samples: 0/6")
+        self._reflector_instr_var = tk.StringVar(value="")
+        self._build_corner_reflector_panel(container)
+
+        auto_row = ttk.Frame(container)
+        auto_row.pack(fill="x", pady=(0, 6))
+        ttk.Button(auto_row, text="Auto Calibrate", command=self._start_auto_calibration).pack(side="left")
+        ttk.Button(auto_row, text="Cancel Auto", command=self._stop_auto_calibration).pack(
+            side="left", padx=6
+        )
+        ttk.Label(
+            container,
+            textvariable=self.auto_status_var,
+            style="CalibInstruction.TLabel",
+            wraplength=720,
+        ).pack(anchor="w", pady=(0, 8))
 
         sample_row = ttk.Frame(container)
         sample_row.pack(fill="x", pady=(0, 8))
@@ -1497,6 +2080,7 @@ class RadarCalibrationWindow:
         self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
         self._sync_options()
         self.sync_from_pipeline()
+        self._refresh_auto_status()
 
     def _sync_options(self) -> None:
         self.pipeline.allow_point_cloud_calibration = self.allow_point_cloud_var.get()
@@ -1528,6 +2112,35 @@ class RadarCalibrationWindow:
                     var.set(params[key])
         finally:
             self._suspend_callbacks = False
+        self.auto_status_var.set(
+            self.pipeline.auto_calibration_status().progress_text()
+        )
+        self.auto_instruction_var.set(
+            self.pipeline.auto_calibration_status().operator_instruction
+            or "Press Auto Calibrate. Keep exactly one person visible and walk slowly."
+        )
+
+    def _refresh_auto_status(self) -> None:
+        try:
+            if not self.window.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        status = self.pipeline.auto_calibration_status()
+        self.auto_status_var.set(status.progress_text())
+        self.auto_instruction_var.set(
+            status.operator_instruction
+            or "Press Auto Calibrate. Keep exactly one person visible and walk slowly."
+        )
+        if (
+            status.state == AutoCalibrationState.MONITORING
+            and status.saved_path
+            and status.saved_path != self._last_auto_saved_path
+        ):
+            self._last_auto_saved_path = status.saved_path
+            self.sync_from_pipeline()
+            self.status_var.set(status.progress_text())
+        self.window.after(500, self._refresh_auto_status)
 
     def _on_change(self, *_args) -> None:
         if self._suspend_callbacks:
@@ -1559,6 +2172,184 @@ class RadarCalibrationWindow:
         self.sync_from_pipeline()
         self.status_var.set("Calibration reset to the live camera intrinsics guess.")
 
+    def _build_mount_prior_panel(self, parent: ttk.Frame) -> None:
+        """Build the Mount Geometry Prior input panel."""
+        prior = self.pipeline.load_mount_geometry_prior()
+        frame = ttk.LabelFrame(parent, text="Mount Geometry Prior (ruler measurements)")
+        frame.pack(fill="x", pady=(0, 8))
+
+        axes = [
+            ("tx", "tx (lateral)",  prior.tx_m),
+            ("ty", "ty (up)",       prior.ty_m),
+            ("tz", "tz (fwd/back)", prior.tz_m),
+        ]
+        for row_idx, (key, label, value_m) in enumerate(axes):
+            in_var = tk.StringVar(value=f"{value_m / 0.0254:.2f}")
+            m_var  = tk.StringVar(value=f"{value_m:.4f} m")
+            self._mount_in_vars[key] = in_var
+            self._mount_m_vars[key]  = m_var
+
+            ttk.Label(frame, text=label, width=16).grid(row=row_idx, column=0, sticky="w", padx=(6,2), pady=2)
+            in_entry = ttk.Entry(frame, textvariable=in_var, width=8)
+            in_entry.grid(row=row_idx, column=1, padx=2)
+            ttk.Label(frame, text="in").grid(row=row_idx, column=2, sticky="w")
+            ttk.Label(frame, textvariable=m_var, width=12).grid(row=row_idx, column=3, sticky="w", padx=(4,0))
+
+            def _update_m(event=None, k=key, iv=in_var, mv=m_var):
+                try:
+                    mv.set(f"{float(iv.get()) * 0.0254:.4f} m")
+                except ValueError:
+                    pass
+            in_entry.bind("<KeyRelease>", _update_m)
+            in_entry.bind("<FocusOut>", _update_m)
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=len(axes), column=0, columnspan=4, sticky="w", padx=6, pady=(4, 6))
+        ttk.Button(btn_row, text="Apply Prior as Seed", command=self._apply_mount_prior).pack(side="left")
+        ttk.Button(btn_row, text="Save Mount Geometry", command=self._save_mount_geometry).pack(side="left", padx=8)
+
+    def _apply_mount_prior(self) -> None:
+        prior = self._mount_prior_from_ui()
+        self.pipeline.save_mount_geometry_prior(prior)
+        self.pipeline.seed_calibration_prior()
+        self.sync_from_pipeline()
+        self.status_var.set(
+            f"Mount prior applied: ty={prior.ty_m:.4f} m, tz={prior.tz_m:.4f} m"
+        )
+
+    def _save_mount_geometry(self) -> None:
+        prior = self._mount_prior_from_ui()
+        self.pipeline.save_mount_geometry_prior(prior)
+        self.status_var.set(f"Mount geometry saved to mount_geometry.json")
+
+    def _mount_prior_from_ui(self) -> MountGeometryPrior:
+        loaded = self.pipeline.load_mount_geometry_prior()
+        try:
+            tx = float(self._mount_in_vars["tx"].get()) * 0.0254
+        except (ValueError, KeyError):
+            tx = loaded.tx_m
+        try:
+            ty = float(self._mount_in_vars["ty"].get()) * 0.0254
+        except (ValueError, KeyError):
+            ty = loaded.ty_m
+        try:
+            tz = float(self._mount_in_vars["tz"].get()) * 0.0254
+        except (ValueError, KeyError):
+            tz = loaded.tz_m
+        return MountGeometryPrior(
+            tx_m=tx, ty_m=ty, tz_m=tz,
+            tx_tolerance_m=loaded.tx_tolerance_m,
+            ty_tolerance_m=loaded.ty_tolerance_m,
+            tz_tolerance_m=loaded.tz_tolerance_m,
+        )
+
+    def _build_corner_reflector_panel(self, parent: ttk.Frame) -> None:
+        from radar_camera_fusion import _GUIDED_POSITIONS
+        total = len(_GUIDED_POSITIONS)
+
+        frame = ttk.LabelFrame(parent, text="Guided Body Calibration")
+        frame.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(
+            frame,
+            text=(
+                "Stand at each position shown below, click your torso centre "
+                "in the video, then press Capture Position."
+            ),
+            wraplength=680,
+        ).pack(anchor="w", padx=6, pady=(4, 2))
+
+        # Big instruction label showing where to stand next.
+        ttk.Label(
+            frame,
+            textvariable=self._reflector_instr_var,
+            font=("TkDefaultFont", 11, "bold"),
+            foreground="#1060c0",
+            wraplength=680,
+        ).pack(anchor="w", padx=8, pady=(2, 4))
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill="x", padx=6, pady=(2, 4))
+        ttk.Button(btn_row, text="Start", command=self._reflector_start).pack(side="left")
+        self._reflector_capture_btn = ttk.Button(
+            btn_row, text="Capture Position", command=self._reflector_capture, state="disabled"
+        )
+        self._reflector_capture_btn.pack(side="left", padx=6)
+        self._reflector_solve_btn = ttk.Button(
+            btn_row, text="Solve", command=self._reflector_solve, state="disabled"
+        )
+        self._reflector_solve_btn.pack(side="left")
+
+        info_row = ttk.Frame(frame)
+        info_row.pack(fill="x", padx=6, pady=(0, 2))
+        ttk.Label(info_row, textvariable=self._reflector_sample_var, width=16).pack(side="left")
+
+        ttk.Label(frame, textvariable=self._reflector_status_var, wraplength=680).pack(
+            anchor="w", padx=6, pady=(0, 6)
+        )
+        self._refresh_reflector_status()
+
+    def _reflector_start(self) -> None:
+        from radar_camera_fusion import _GUIDED_POSITIONS
+        msg = self.pipeline.corner_reflector_start()
+        self._reflector_status_var.set(msg)
+        self._reflector_capture_btn.config(state="normal")
+        self._reflector_solve_btn.config(state="disabled")
+        self._reflector_sample_var.set(f"Samples: 0/{len(_GUIDED_POSITIONS)}")
+        self._reflector_instr_var.set(
+            f"Step 1/{len(_GUIDED_POSITIONS)}: {_GUIDED_POSITIONS[0]}"
+        )
+
+    def _reflector_capture(self) -> None:
+        from radar_camera_fusion import _GUIDED_POSITIONS, GuidedBodyCalibState
+        msg = self.pipeline.corner_reflector_capture()
+        self._reflector_status_var.set(msg)
+        n = self.pipeline.corner_reflector_sample_count()
+        total = len(_GUIDED_POSITIONS)
+        self._reflector_sample_var.set(f"Samples: {n}/{total}")
+        state = self.pipeline.corner_reflector_calib.state
+        if state == GuidedBodyCalibState.DONE:
+            self._reflector_solve_btn.config(state="normal")
+            self._reflector_instr_var.set("All positions captured — press Solve.")
+        elif n < total:
+            self._reflector_instr_var.set(
+                f"Step {n + 1}/{total}: {_GUIDED_POSITIONS[n]}"
+            )
+        # Enable Solve early once MIN_POSITIONS reached.
+        if n >= self.pipeline.corner_reflector_calib.MIN_POSITIONS:
+            self._reflector_solve_btn.config(state="normal")
+
+    def _reflector_solve(self) -> None:
+        msg = self.pipeline.corner_reflector_solve()
+        self._reflector_status_var.set(msg)
+        self._reflector_instr_var.set("")
+        self.sync_from_pipeline()
+        self.status_var.set(msg)
+
+    def _refresh_reflector_status(self) -> None:
+        if not self.window.winfo_exists():
+            return
+        self._reflector_status_var.set(self.pipeline.corner_reflector_status())
+        self.window.after(500, self._refresh_reflector_status)
+
+    def _start_auto_calibration(self) -> None:
+        try:
+            message = self.pipeline.auto_calibration_start()
+            self.auto_status_var.set(self.pipeline.auto_calibration_status().progress_text())
+            self.auto_instruction_var.set(
+                self.pipeline.auto_calibration_status().operator_instruction
+            )
+            self.status_var.set(message)
+        except Exception as exc:
+            self.status_var.set(f"Auto calibration failed to start: {exc}")
+
+    def _stop_auto_calibration(self) -> None:
+        self.status_var.set(self.pipeline.auto_calibration_stop())
+        self.auto_status_var.set(self.pipeline.auto_calibration_status().progress_text())
+        self.auto_instruction_var.set(
+            self.pipeline.auto_calibration_status().operator_instruction
+        )
+
     def _capture_sample(self) -> None:
         try:
             message = self.pipeline.capture_calibration_sample()
@@ -1570,7 +2361,13 @@ class RadarCalibrationWindow:
 
     def _solve_samples(self) -> None:
         try:
-            message = self.pipeline.solve_calibration_samples()
+            if (
+                self.pipeline.calibration_sample_count() == 0
+                and self.pipeline.auto_calibration_status().sample_count > 0
+            ):
+                message = self.pipeline.auto_calibration_solve_now()
+            else:
+                message = self.pipeline.solve_calibration_samples()
             self.sync_from_pipeline()
             self.status_var.set(message)
         except Exception as exc:
@@ -1633,6 +2430,12 @@ class FalconGUI:
                         font=("Segoe UI", 14, "bold"))
         style.configure("Status.TLabel", background=BG, foreground="#a6adc8",
                         font=("Segoe UI", 9))
+        style.configure("CalibHero.TLabel", background=BG, foreground="#f5e0dc",
+                        font=("Segoe UI", 18, "bold"))
+        style.configure("CalibInstruction.TLabel", background=BG, foreground="#a6e3a1",
+                        font=("Segoe UI", 14, "bold"))
+        style.configure("CalibDetail.TLabel", background=BG, foreground="#cdd6f4",
+                        font=("Segoe UI", 11))
         style.configure("TButton", background=BTN_BG, foreground=FG,
                         font=("Segoe UI", 10, "bold"), padding=6)
         style.map("TButton",
@@ -1682,11 +2485,7 @@ class FalconGUI:
         ttk.Label(ctrl, text="Detection Model:").grid(
             row=2, column=0, sticky="w", pady=(0, 2))
 
-        default_model = (
-            "YOLO26 Nano (TensorRT)"
-            if Path("yolo26n-pose.engine").exists()
-            else "YOLO26 Nano (Default)"
-        )
+        default_model = "Camera Only"
         self.model_var = tk.StringVar(value=default_model)
         model_cb = ttk.Combobox(
             ctrl, textvariable=self.model_var,
@@ -1736,67 +2535,80 @@ class FalconGUI:
         sep = ttk.Separator(ctrl, orient="horizontal")
         sep.grid(row=8, column=0, sticky="ew", pady=(0, 10))
 
+        ttk.Label(ctrl, text="Fusion View:").grid(
+            row=9, column=0, sticky="w", pady=(0, 2))
+        self.fusion_view_var = tk.StringVar(value=FusionViewMode.PRODUCTION)
+        fusion_view_cb = ttk.Combobox(
+            ctrl,
+            textvariable=self.fusion_view_var,
+            values=[FusionViewMode.PRODUCTION, FusionViewMode.DEBUG],
+            state="readonly",
+            width=28,
+        )
+        fusion_view_cb.grid(row=10, column=0, sticky="ew", pady=(0, 10))
+        fusion_view_cb.bind("<<ComboboxSelected>>", self._sync_toggles)
+
         ttk.Label(ctrl, text="Overlays", style="Header.TLabel"
-                  ).grid(row=9, column=0, sticky="w", pady=(0, 6))
+                  ).grid(row=11, column=0, sticky="w", pady=(0, 6))
 
         self.skel_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(ctrl, text="Show Skeleton",
                         variable=self.skel_var,
                         command=self._sync_toggles
-                        ).grid(row=10, column=0, sticky="w", pady=2)
+                        ).grid(row=12, column=0, sticky="w", pady=2)
 
         self.pred_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(ctrl, text="Show Kalman Predictions",
                         variable=self.pred_var,
                         command=self._sync_toggles
-                        ).grid(row=11, column=0, sticky="w", pady=2)
+                        ).grid(row=13, column=0, sticky="w", pady=2)
 
         self.radar_overlay_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(ctrl, text="Show Radar Overlay",
                         variable=self.radar_overlay_var,
                         command=self._sync_toggles
-                        ).grid(row=12, column=0, sticky="w", pady=2)
+                        ).grid(row=14, column=0, sticky="w", pady=2)
 
         self.radar_points_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(ctrl, text="Show Radar Points",
                         variable=self.radar_points_var,
                         command=self._sync_toggles
-                        ).grid(row=13, column=0, sticky="w", pady=2)
+                        ).grid(row=15, column=0, sticky="w", pady=2)
 
         self.radar_tracks_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(ctrl, text="Show Radar Tracks",
                         variable=self.radar_tracks_var,
                         command=self._sync_toggles
-                        ).grid(row=14, column=0, sticky="w", pady=2)
+                        ).grid(row=16, column=0, sticky="w", pady=2)
 
         self.fusion_debug_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(ctrl, text="Show Fusion Debug",
                         variable=self.fusion_debug_var,
                         command=self._sync_toggles
-                        ).grid(row=15, column=0, sticky="w", pady=2)
+                        ).grid(row=17, column=0, sticky="w", pady=2)
 
         ttk.Button(ctrl, text="Radar Calibrator",
                    command=self._open_calibration_window
-                   ).grid(row=16, column=0, sticky="ew", pady=(10, 0))
+                   ).grid(row=18, column=0, sticky="ew", pady=(10, 0))
 
         # ── Status bar ──────────────────────────────────────────────
         sep2 = ttk.Separator(ctrl, orient="horizontal")
-        sep2.grid(row=17, column=0, sticky="ew", pady=(16, 10))
+        sep2.grid(row=19, column=0, sticky="ew", pady=(16, 10))
 
         self.status_var = tk.StringVar(value="Status: Idle")
         ttk.Label(ctrl, textvariable=self.status_var,
                   style="Status.TLabel", wraplength=250
-                  ).grid(row=18, column=0, sticky="w")
+                  ).grid(row=20, column=0, sticky="w")
 
         self.fps_var = tk.StringVar(value="FPS: --")
         ttk.Label(ctrl, textvariable=self.fps_var,
                   style="Status.TLabel"
-                  ).grid(row=19, column=0, sticky="w", pady=(4, 0))
+                  ).grid(row=21, column=0, sticky="w", pady=(4, 0))
 
         self.radar_var = tk.StringVar(value="Radar: --")
         ttk.Label(ctrl, textvariable=self.radar_var,
                   style="Status.TLabel", wraplength=250
-                  ).grid(row=20, column=0, sticky="w", pady=(4, 0))
+                  ).grid(row=22, column=0, sticky="w", pady=(4, 0))
 
         # ── Photo image reference (prevent GC) ──────────────────────
         self._photo: Optional[ImageTk.PhotoImage] = None
@@ -1809,6 +2621,7 @@ class FalconGUI:
         self.model_desc_var.set(MODEL_OPTIONS[key]["description"])
 
     def _sync_toggles(self):
+        self.pipeline.fusion_view_mode = self.fusion_view_var.get()
         self.pipeline.show_skeleton = self.skel_var.get()
         self.pipeline.show_predictions = self.pred_var.get()
         self.pipeline.show_radar_overlay = self.radar_overlay_var.get()
@@ -1848,9 +2661,10 @@ class FalconGUI:
         # Load model after camera succeeds so bad camera indices fail cleanly
         err = self.pipeline.load_model(self.model_var.get())
         if err:
-            self.pipeline.close_camera()
-            self.status_var.set(f"Error: {err}")
-            return
+            print(f"[FALCON] {err}; continuing with camera-only feed")
+            self.pipeline.backend = "none"
+            self.pipeline.model = None
+            self.pipeline.mp_pose = None
 
         # Sync toggle state
         self._sync_toggles()
@@ -1866,7 +2680,10 @@ class FalconGUI:
 
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.status_var.set("Status: Running")
+        if err:
+            self.status_var.set("Status: Running camera only")
+        else:
+            self.status_var.set("Status: Running")
 
         # Begin GUI refresh loop
         self._refresh()

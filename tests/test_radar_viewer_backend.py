@@ -189,6 +189,48 @@ class CalibrationSolverTests(unittest.TestCase):
         # whether the median error passes its default threshold.
         self.assertIsInstance(result, radar_camera_fusion.CalibrationSolveResult)
 
+    def test_solve_calibration_auto_rejects_bad_depth_instead_of_2d_overfit(self):
+        K = np.array([[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]])
+        truth = radar.CameraProjection(K=K.copy())
+        radar_points = [
+            [-0.8, 1.5, 0.2],
+            [-0.4, 2.0, 0.0],
+            [0.0, 2.5, 0.4],
+            [0.4, 3.0, -0.1],
+            [0.8, 3.5, 0.3],
+            [-0.2, 4.0, 0.1],
+        ]
+        samples = []
+        for index, point in enumerate(radar_points):
+            p = np.asarray(point, dtype=np.float64)
+            u, v = truth.project_3d_to_2d(p)
+            camera_xyz = truth.radar_to_camera(p)
+            camera_xyz = camera_xyz + np.asarray(
+                [
+                    -1.0 if index % 2 == 0 else 1.0,
+                    0.5 if index % 3 == 0 else -0.4,
+                    0.0,
+                ],
+                dtype=np.float64,
+            )
+            samples.append(
+                radar_camera_fusion.CalibrationSample(
+                    radar_xyz=[float(value) for value in p],
+                    image_uv=[float(u), float(v)],
+                    camera_xyz=[float(value) for value in camera_xyz],
+                    depth_m=float(camera_xyz[2]),
+                    source="bad_depth_test",
+                )
+            )
+
+        two_d = radar_camera_fusion.solve_calibration_samples(samples, radar.CameraProjection(K=K.copy()))
+        self.assertTrue(two_d.ok, msg=two_d.message)
+
+        auto = radar_camera_fusion.solve_calibration_auto(samples, radar.CameraProjection(K=K.copy()))
+        self.assertFalse(auto.ok)
+        self.assertEqual(auto.solve_type, "3d")
+        self.assertIn("Refusing 2-D fallback", auto.message)
+
 
 class MountGeometryTemplatingTests(unittest.TestCase):
     def test_apply_mount_geometry_rewrites_sensor_position_and_boxes(self):

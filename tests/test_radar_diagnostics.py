@@ -75,6 +75,45 @@ def build_short_track_record(
     )
 
 
+class FakeSerialPort:
+    def __init__(
+        self,
+        response: bytes = b"sensorStop\nDone\n",
+        *,
+        name: str = "serial",
+        events=None,
+    ):
+        self._read_buffer = bytearray(response)
+        self.name = name
+        self.events = events if events is not None else []
+        self.writes = []
+        self.is_open = True
+
+    @property
+    def in_waiting(self):
+        return len(self._read_buffer)
+
+    def write(self, data):
+        self.writes.append(bytes(data))
+        self.events.append((self.name, "write", bytes(data)))
+        return len(data)
+
+    def read(self, size=1):
+        if not self._read_buffer:
+            return b""
+        size = max(1, int(size))
+        chunk = bytes(self._read_buffer[:size])
+        del self._read_buffer[:size]
+        return chunk
+
+    def reset_input_buffer(self):
+        self._read_buffer.clear()
+
+    def close(self):
+        self.events.append((self.name, "close", b""))
+        self.is_open = False
+
+
 class ReplayLoadingTests(unittest.TestCase):
     def test_load_replay_capture_normalizes_frames(self):
         capture = radar.load_replay_capture(ROOT / "04_01_2026_16_12_52" / "replay_8.json")
@@ -470,6 +509,139 @@ class HealthVerdictTests(unittest.TestCase):
         )
         self.assertEqual(verdict, radar.HEALTH_HEALTHY)
         self.assertIn("frames are parsing", reason.lower())
+
+
+class DriverShutdownTests(unittest.TestCase):
+    def test_open_serial_uses_quiet_non_flow_control_settings(self):
+        if not radar._HAS_SERIAL:
+            self.skipTest("pyserial is not installed")
+
+        created = []
+        old_serial = radar.serial.Serial
+
+        class FakePySerial:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.port = kwargs.get("port")
+                self.is_open = False
+                self.exclusive = None
+                self.events = []
+                self._rts = None
+                self._dtr = None
+                created.append(self)
+
+            @property
+            def rts(self):
+                return self._rts
+
+            @rts.setter
+            def rts(self, value):
+                self._rts = bool(value)
+                self.events.append(("rts", bool(value)))
+
+            @property
+            def dtr(self):
+                return self._dtr
+
+            @dtr.setter
+            def dtr(self, value):
+                self._dtr = bool(value)
+                self.events.append(("dtr", bool(value)))
+
+            def open(self):
+                self.events.append(("open", self.port))
+                self.is_open = True
+
+        radar.serial.Serial = FakePySerial
+        try:
+            ser = radar.open_serial_with_retries(
+                "/dev/ttyUSB0",
+                115200,
+                timeout=0.25,
+                attempts=1,
+            )
+        finally:
+            radar.serial.Serial = old_serial
+
+        self.assertIs(ser, created[0])
+        self.assertIsNone(ser.kwargs["port"])
+        self.assertEqual(ser.kwargs["baudrate"], 115200)
+        self.assertEqual(ser.kwargs["timeout"], 0.25)
+        self.assertFalse(ser.kwargs["xonxoff"])
+        self.assertFalse(ser.kwargs["rtscts"])
+        self.assertFalse(ser.kwargs["dsrdtr"])
+        self.assertEqual(ser.port, "/dev/ttyUSB0")
+        self.assertTrue(ser.is_open)
+        self.assertTrue(ser.exclusive)
+        self.assertEqual(
+            ser.events,
+            [
+                ("rts", False),
+                ("dtr", False),
+                ("open", "/dev/ttyUSB0"),
+                ("rts", False),
+                ("dtr", False),
+            ],
+        )
+
+    def test_close_sends_sensor_stop_before_closing_ports(self):
+        events = []
+        cfg_ser = FakeSerialPort(name="cli", events=events)
+        data_ser = FakeSerialPort(response=b"", name="data", events=events)
+        driver = radar.IWR6843Driver()
+        driver._config_serial = cfg_ser
+        driver._data_serial = data_ser
+        driver._running = True
+        driver._connected = True
+        radar._register_active_driver(driver)
+
+        driver.close()
+
+        self.assertIn(b"sensorStop\n", cfg_ser.writes)
+        self.assertFalse(cfg_ser.is_open)
+        self.assertFalse(data_ser.is_open)
+        self.assertNotIn(driver, list(radar._ACTIVE_DRIVERS))
+        self.assertEqual(
+            events,
+            [
+                ("cli", "write", b"sensorStop\n"),
+                ("cli", "close", b""),
+                ("data", "close", b""),
+            ],
+        )
+
+    def test_open_data_port_failure_stops_existing_sensor_before_close(self):
+        if not radar._HAS_SERIAL:
+            self.skipTest("pyserial is not installed")
+
+        cfg_ser = FakeSerialPort()
+        opened_ports = []
+        old_open = radar.open_serial_with_retries
+        old_settle = radar._CLI_POST_OPEN_SETTLE_S
+
+        def fake_open_serial(port, baudrate, *, timeout, attempts=1, retry_delay_s=0.0):
+            del baudrate, timeout, attempts, retry_delay_s
+            opened_ports.append(port)
+            if len(opened_ports) == 1:
+                return cfg_ser
+            raise radar.serial.SerialException("data port busy")
+
+        radar.open_serial_with_retries = fake_open_serial
+        radar._CLI_POST_OPEN_SETTLE_S = 0.0
+        try:
+            driver = radar.IWR6843Driver(
+                config_port="cfg",
+                data_port="data",
+                config_path="iwr6843_people_tracking_20fps.cfg",
+            )
+            self.assertFalse(driver.open())
+        finally:
+            radar.open_serial_with_retries = old_open
+            radar._CLI_POST_OPEN_SETTLE_S = old_settle
+
+        self.assertEqual(opened_ports, ["cfg", "data"])
+        self.assertIn(b"sensorStop\n", cfg_ser.writes)
+        self.assertFalse(cfg_ser.is_open)
 
 
 class PortDiscoveryTests(unittest.TestCase):

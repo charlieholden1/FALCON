@@ -13,6 +13,9 @@ if str(ROOT) not in sys.path:
 import radar
 from occlusion import OcclusionState
 from radar_camera_fusion import (
+    AutoCalibrationConfig,
+    AutoCalibrationController,
+    AutoCalibrationState,
     CalibrationSample,
     FusionConfig,
     FusionEventLogger,
@@ -100,6 +103,52 @@ def make_radar_frame(track_id=7, x=0.0, y=2.0, z=0.0):
     )
 
 
+def make_multi_radar_frame():
+    return radar.RadarFrame(
+        frame_number=12,
+        subframe_number=0,
+        num_detected_obj=2,
+        num_tlvs=2,
+        points=[],
+        timestamp=time.time(),
+        tracks=[
+            radar.RadarTrack(
+                track_id=7,
+                x=0.00,
+                y=2.00,
+                z=0.00,
+                confidence=0.90,
+                bbox=radar.RadarBox3D(
+                    x_min=-0.35,
+                    x_max=0.35,
+                    y_min=1.70,
+                    y_max=2.30,
+                    z_min=0.0,
+                    z_max=1.75,
+                    track_id=7,
+                ),
+            ),
+            radar.RadarTrack(
+                track_id=9,
+                x=0.12,
+                y=2.05,
+                z=0.02,
+                confidence=0.55,
+                bbox=radar.RadarBox3D(
+                    x_min=-0.20,
+                    x_max=0.45,
+                    y_min=1.75,
+                    y_max=2.35,
+                    z_min=0.0,
+                    z_max=1.70,
+                    track_id=9,
+                ),
+            ),
+        ],
+        presence=1,
+    )
+
+
 def make_point_cloud_frame():
     return radar.RadarFrame(
         frame_number=11,
@@ -134,8 +183,19 @@ class SyntheticPoseTests(unittest.TestCase):
 
 
 class FusionManagerTests(unittest.TestCase):
+    def _test_config(self, **overrides):
+        base = FusionConfig(
+            min_radar_track_age_frames=1,
+            min_radar_link_stable_frames=1,
+            blocked_frames_to_radar=1,
+            lost_frames_to_radar=2,
+        )
+        for key, value in overrides.items():
+            setattr(base, key, value)
+        return base
+
     def test_camera_locked_when_detection_is_healthy(self):
-        manager = RadarCameraFusionManager()
+        manager = RadarCameraFusionManager(config=self._test_config())
         track = make_camera_track()
 
         manager.update([track], make_radar_frame(), radar.CameraProjection(), frame_shape=(480, 640, 3))
@@ -144,7 +204,7 @@ class FusionManagerTests(unittest.TestCase):
         self.assertFalse(track.using_radar)
 
     def test_occlusion_enters_radar_only_and_preserves_person_id(self):
-        manager = RadarCameraFusionManager()
+        manager = RadarCameraFusionManager(config=self._test_config())
         projection = radar.CameraProjection()
         track = make_camera_track()
         radar_frame = make_radar_frame(track_id=7)
@@ -165,7 +225,7 @@ class FusionManagerTests(unittest.TestCase):
         self.assertEqual(track.keypoints.shape, (17, 3))
 
     def test_bad_radar_projection_does_not_steal_track(self):
-        manager = RadarCameraFusionManager(config=FusionConfig(radar_pixel_tolerance=80.0))
+        manager = RadarCameraFusionManager(config=self._test_config(radar_pixel_tolerance=80.0))
         track = make_camera_track()
         track.frames_since_detection = 3
         track.is_predicted = True
@@ -182,7 +242,7 @@ class FusionManagerTests(unittest.TestCase):
         self.assertIsNone(track.radar_track_id)
 
     def test_camera_recapture_releases_radar_and_keeps_id(self):
-        manager = RadarCameraFusionManager()
+        manager = RadarCameraFusionManager(config=self._test_config())
         projection = radar.CameraProjection()
         track = make_camera_track()
         radar_frame = make_radar_frame(track_id=7)
@@ -208,7 +268,10 @@ class FusionManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "fusion_events.jsonl"
             logger = FusionEventLogger(path)
-            manager = RadarCameraFusionManager(event_logger=logger)
+            manager = RadarCameraFusionManager(
+                config=self._test_config(),
+                event_logger=logger,
+            )
             track = make_camera_track()
             track.frames_since_detection = 3
             track.is_predicted = True
@@ -225,6 +288,36 @@ class FusionManagerTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertIn("radar_only", text)
             self.assertIn('"falcon_track_id":1', text)
+
+    def test_live_blocked_camera_swaps_cleanly_to_radar(self):
+        manager = RadarCameraFusionManager(config=self._test_config())
+        projection = radar.CameraProjection()
+        track = make_camera_track()
+        track.detection_conf = 0.20
+        track.keypoints = keypoints_for_bbox(track.bbox, confidence=0.10)
+        track.occlusion_state = OcclusionState.HEAVILY_OCCLUDED
+
+        manager.update([track], make_radar_frame(track_id=7), projection, frame_shape=(480, 1280, 3))
+
+        self.assertTrue(track.using_radar)
+        self.assertEqual(track.fusion_mode, FusionMode.RADAR_ONLY.value)
+        self.assertEqual(track.radar_track_id, 7)
+
+    def test_duplicate_radar_tracks_are_suppressed_in_single_person_mode(self):
+        manager = RadarCameraFusionManager(config=self._test_config())
+        projection = radar.CameraProjection()
+        track = make_camera_track()
+        track.frames_since_detection = 3
+        track.is_predicted = True
+        track.occlusion_state = OcclusionState.HEAVILY_OCCLUDED
+
+        manager.update([track], make_multi_radar_frame(), projection, frame_shape=(480, 1280, 3))
+
+        self.assertTrue(track.using_radar)
+        self.assertEqual(track.radar_track_id, 7)
+        self.assertEqual(manager.debug_snapshot.radar_track_count_raw, 2)
+        self.assertEqual(manager.debug_snapshot.radar_track_count, 1)
+        self.assertEqual(manager.debug_snapshot.duplicate_tracks_suppressed, 1)
 
 
 class CalibrationTests(unittest.TestCase):
@@ -316,6 +409,32 @@ class CalibrationTests(unittest.TestCase):
 
         self.assertTrue(result.ok, result.message)
         self.assertLess(result.median_error_px, 5.0)
+
+    def test_auto_controller_accepts_existing_synthetic_fixture(self):
+        frame = make_radar_frame(track_id=5)
+        controller = AutoCalibrationController(
+            radar.CameraProjection(),
+            FusionEventLogger(),
+            AutoCalibrationConfig(
+                min_radar_age_frames=1,
+                stable_link_frames=1,
+                min_sample_interval_s=0.0,
+                min_hold_frames=1,
+            ),
+        )
+        controller.start()
+
+        status = controller.update(
+            [make_camera_track()],
+            frame,
+            None,
+            (480, 1280, 3),
+            now=frame.timestamp,
+        )
+
+        self.assertEqual(status.state, AutoCalibrationState.COLLECTING)
+        self.assertEqual(len(controller.samples), 1)
+        self.assertEqual(controller.samples[0].radar_track_id, 5)
 
 
 if __name__ == "__main__":
